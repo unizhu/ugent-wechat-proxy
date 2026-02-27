@@ -1,0 +1,71 @@
+[package]
+name = "ugent-wechat-proxy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+authors = ["UGENT Team"]
+license = "MIT"
+description = "Public proxy server for UGENT WeChat integration - bridges WeChat webhooks to local UGENT via WebSocket"
+readme = "README.md"
+keywords = ["wechat", "proxy", "websocket", "ugent", "bot"]
+categories = ["network-programming", "web-programming::websocket"]
+
+[[bin]]
+name = "ugent-wechat-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "request-id"] }
+
+# WebSocket
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-xml-rs = "0.6"
+
+# Crypto
+sha1 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+cbc = "0.1"
+base64 = "0.22"
+rand = "0.9"
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+config = "0.15"
+dotenvy = "0.15"
+
+# Utils
+thiserror = "2"
+anyhow = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+
+# Metrics (optional)
+prometheus = { version = "0.13", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+
+[features]
+default = []
+metrics = ["prometheus"]
