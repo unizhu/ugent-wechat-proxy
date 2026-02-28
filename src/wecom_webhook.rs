@@ -266,7 +266,7 @@ mod tests {
 
         let body: WecomEncryptedBody = serde_xml_rs::from_str(xml).unwrap();
         assert_eq!(body.to_user_name, "ww1234567890abcdef");
-        assert_eq!(body.agent_id, Some(1000002));
+        assert_eq!(body.agent_id, Some("1000002".to_string()));
         assert_eq!(body.encrypt, "encrypted_content_here");
     }
 }

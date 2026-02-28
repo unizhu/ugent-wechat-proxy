@@ -143,8 +143,9 @@ pub struct WecomEncryptedParams {
 pub struct WecomEncryptedBody {
     #[serde(rename = "ToUserName")]
     pub to_user_name: String,
-    #[serde(rename = "AgentID")]
-    pub agent_id: Option<i64>,
+    /// AgentID may be empty CDATA, so use String and parse later
+    #[serde(rename = "AgentID", default)]
+    pub agent_id: Option<String>,
     #[serde(rename = "Encrypt")]
     pub encrypt: String,
 }
