@@ -66,13 +66,13 @@ async fn log_request(req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    
+
     info!("🌐 HTTP {} {}{}", method, uri.path(), query);
-    
+
     let response = next.run(req).await;
-    
+
     info!("📤 Response status: {}", response.status());
-    
+
     response
 }
 

@@ -3,8 +3,7 @@
 use axum::{
     Router,
     extract::{
-        State,
-        ConnectInfo,
+        ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::Response,
