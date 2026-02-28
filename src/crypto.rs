@@ -3,14 +3,10 @@
 //! Handles SHA1 signature verification and AES-256-CBC encryption/decryption
 //! for WeChat Official Account and WeCom messages.
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockDecryptMut, KeyIvInit};
 use anyhow::{Context, Result, anyhow};
 use base64::engine::general_purpose;
 use sha1::{Digest, Sha1};
-
-type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
-#[cfg(test)]
-type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 
 /// WeChat cryptographic handler
 #[derive(Clone)]
@@ -26,8 +22,11 @@ impl WechatCrypto {
         let encoding_aes_key = encoding_aes_key.trim();
 
         eprintln!("[DEBUG] EncodingAESKey length: {}", encoding_aes_key.len());
-        eprintln!("[DEBUG] EncodingAESKey first 10 chars: {}", &encoding_aes_key[..encoding_aes_key.len().min(10)]);
-        
+        eprintln!(
+            "[DEBUG] EncodingAESKey first 10 chars: {}",
+            &encoding_aes_key[..encoding_aes_key.len().min(10)]
+        );
+
         if encoding_aes_key.len() != 43 {
             return Err(anyhow!(
                 "EncodingAESKey must be 43 characters, got {} (value: '{}')",
@@ -59,7 +58,7 @@ impl WechatCrypto {
         })
     }
 
-            /// Decode WeCom's non-standard base64 key
+    /// Decode WeCom's non-standard base64 key
     ///
     /// WeCom uses 43 base64 characters without standard padding.
     /// The 43rd character encodes only 2 bits of data (not full 6 bits).
@@ -67,21 +66,22 @@ impl WechatCrypto {
     /// 43 chars * 6 bits = 258 bits, but we only need 256 bits (32 bytes)
     /// So the last char's bottom 2 bits are ignored.
     fn decode_wecom_key(key: &str) -> Result<Vec<u8>> {
-        const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        
+        const BASE64_CHARS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
         let bytes = key.as_bytes();
         if bytes.len() != 43 {
             return Err(anyhow!("Key must be 43 characters, got {}", bytes.len()));
         }
-        
+
         // Build reverse lookup table
         let mut decode_table = [0xFFu8; 256];
         for (i, &c) in BASE64_CHARS.iter().enumerate() {
             decode_table[c as usize] = i as u8;
         }
-        
+
         let mut result = Vec::with_capacity(32);
-        
+
         // Process first 42 characters in chunks of 4 (gives 31 bytes)
         for chunk in bytes[..40].chunks(4) {
             let v = [
@@ -90,61 +90,64 @@ impl WechatCrypto {
                 decode_table[chunk[2] as usize],
                 decode_table[chunk[3] as usize],
             ];
-            
+
             if v.contains(&0xFF) {
                 return Err(anyhow!("Invalid base64 character in key"));
             }
-            
+
             result.push((v[0] << 2) | (v[1] >> 4));
             result.push((v[1] << 4) | (v[2] >> 2));
             result.push((v[2] << 6) | v[3]);
         }
-        
+
         // Handle characters 40, 41 (produces bytes 30, 31)
         let v40 = decode_table[bytes[40] as usize];
         let v41 = decode_table[bytes[41] as usize];
         let v42 = decode_table[bytes[42] as usize];
-        
+
         if v40 == 0xFF || v41 == 0xFF || v42 == 0xFF {
             return Err(anyhow!("Invalid base64 character in last 3 chars"));
         }
-        
+
         // Byte 30 from chars 40, 41
         result.push((v40 << 2) | (v41 >> 4));
-        
+
         // Byte 31 from chars 41, 42 (only top 4 bits of v42)
         result.push((v41 << 4) | (v42 >> 2));
-        
+
         // Byte 32: WeCom ignores the last 2 bits of v42, so we don't need another byte
         // But we need 32 bytes! The last byte comes from the remaining bits.
         // Actually, 43 base64 chars = 258 bits = 32 bytes + 2 extra bits
         // The extra 2 bits should be 0, but WeCom doesn't validate them.
-        // 
+        //
         // Wait - let me recalculate:
         // 42 chars * 6 bits = 252 bits = 31.5 bytes
         // 43 chars * 6 bits = 258 bits = 32.25 bytes (we take 32 bytes = 256 bits)
         // So the 43rd char provides the final 6 bits, but we only need 4 of them for 32 bytes
         // Actually: byte 31 (0-indexed) = bits 248-255
         // chars 0-41 give 252 bits (31.5 bytes) = bytes 0-31, with last 4 bits coming from char 42
-        
+
         // Let me trace more carefully:
         // 42 chars -> 42 * 6 = 252 bits
         // 252 / 8 = 31.5 bytes, so we have 31 bytes and 4 bits extra
         // Char 42 adds 6 more bits = 10 bits total = 1 byte + 2 bits extra
         // So 43 chars gives 32 bytes + 2 bits (ignored)
-        
+
         // The issue: my calculation for byte 31 is wrong!
         // Byte 31 needs bits from both char 41 and char 42
-        
+
         // Actually the result is already 32 bytes after the last push!
         // Let me verify: 10 chunks of 4 chars = 30 bytes
         // Plus 2 more bytes from chars 40-42 = 32 bytes total ✓
-        
+
         if result.len() != 32 {
             return Err(anyhow!("Decoded to {} bytes, expected 32", result.len()));
         }
 
-        eprintln!("[DEBUG] Manual decode succeeded, key hex: {:02x?}", &result[..8]);
+        eprintln!(
+            "[DEBUG] Manual decode succeeded, key hex: {:02x?}",
+            &result[..8]
+        );
         Ok(result)
     }
 
@@ -182,7 +185,7 @@ impl WechatCrypto {
         hex::encode(hash) == msg_signature
     }
 
-        /// Decrypt WeChat message
+    /// Decrypt WeChat message
     ///
     /// Format: random(16) + msg_len(4) + msg + app_id
     pub fn decrypt(&self, encrypted: &str) -> Result<String> {
@@ -191,8 +194,14 @@ impl WechatCrypto {
             .context("Failed to base64 decode encrypted message")?;
 
         eprintln!("[DEBUG] Encrypted bytes length: {}", encrypted_bytes.len());
-        eprintln!("[DEBUG] Key (first 8 bytes): {:02x?}", &self.encoding_aes_key[..8]);
-        eprintln!("[DEBUG] IV (first 8 bytes): {:02x?}", &self.encoding_aes_key[..8]);
+        eprintln!(
+            "[DEBUG] Key (first 8 bytes): {:02x?}",
+            &self.encoding_aes_key[..8]
+        );
+        eprintln!(
+            "[DEBUG] IV (first 8 bytes): {:02x?}",
+            &self.encoding_aes_key[..8]
+        );
 
         if encrypted_bytes.len() < 32 {
             return Err(anyhow!(
@@ -213,40 +222,40 @@ impl WechatCrypto {
         // WeChat/WeCom uses IV = first 16 bytes of the key (NOT zeros!)
         // See: https://developer.work.weixin.qq.com/document/path/90968
         let iv = &self.encoding_aes_key[..16];
-        let cipher = Aes256CbcDec::new_from_slices(&self.encoding_aes_key, iv)
-            .context("Failed to create AES cipher")?;
+
+        // WeChat OA uses 16-byte PKCS#7 padding.
+        // WeCom uses 32-byte PKCS#7 padding.
+        // Standard aes library only supports up to block_size (16) padded unpadding.
+        // So we decrypt without padding and manually check/remove it.
+        type Aes256CbcDecNoPadding = cbc::Decryptor<aes::Aes256>;
+        let cipher_np = Aes256CbcDecNoPadding::new_from_slices(&self.encoding_aes_key, iv)
+            .context("Failed to create AES cipher (no padding)")?;
 
         // Need to decrypt in place with buffer
         let mut buf = encrypted_bytes.clone();
-        let decrypted = match cipher.decrypt_padded_mut::<Pkcs7>(&mut buf) {
-            Ok(d) => d.to_vec(),
-            Err(e) => {
-                eprintln!("[DEBUG] PKCS7 padding error: {:?}", e);
-                eprintln!("[DEBUG] Trying to decrypt anyway and check padding manually...");
-                
-                // Try with NoPadding and manually check
-                // This helps debug if the key is wrong or just padding issue
-                use aes::cipher::BlockDecryptMut;
-                type Aes256CbcDecNoPadding = cbc::Decryptor<aes::Aes256>;
-                let cipher_np = Aes256CbcDecNoPadding::new_from_slices(&self.encoding_aes_key, iv)
-                    .context("Failed to create AES cipher (no padding)")?;
-                let mut buf2 = encrypted_bytes.clone();
-                let decrypted_raw = cipher_np.decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut buf2)
-                    .map_err(|e| anyhow!("AES decrypt failed: {:?}", e))?;
-                
-                // Check last byte for PKCS7 padding
-                let last_byte = decrypted_raw[decrypted_raw.len() - 1] as usize;
-                eprintln!("[DEBUG] Last byte (padding indicator): {}", last_byte);
-                eprintln!("[DEBUG] Last 16 bytes: {:02x?}", &decrypted_raw[decrypted_raw.len()-16..]);
-                
-                if last_byte > 0 && last_byte <= 16 {
-                    // Valid PKCS7 padding
-                    decrypted_raw[..decrypted_raw.len() - last_byte].to_vec()
-                } else {
-                    return Err(anyhow!("Failed to decrypt message (PKCS7 padding error): {:?}", e));
-                }
+        let decrypted_raw = cipher_np
+            .decrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut buf)
+            .map_err(|e| anyhow!("AES decrypt failed: {:?}", e))?;
+
+        // Check last byte for PKCS7 padding
+        if decrypted_raw.is_empty() {
+            return Err(anyhow!("Decrypted message is empty"));
+        }
+        let last_byte = decrypted_raw[decrypted_raw.len() - 1] as usize;
+
+        // Standard PKCS7 padding check for up to 32 bytes (dynamically adapts)
+        if last_byte == 0 || last_byte > 32 || last_byte > decrypted_raw.len() {
+            return Err(anyhow!("Invalid PKCS7 padding length: {}", last_byte));
+        }
+
+        // Verify all padding bytes are correct
+        for i in 0..last_byte {
+            if decrypted_raw[decrypted_raw.len() - 1 - i] != last_byte as u8 {
+                return Err(anyhow!("Invalid PKCS7 padding byte at offset {}", i));
             }
-        };
+        }
+
+        let decrypted = decrypted_raw[..decrypted_raw.len() - last_byte].to_vec();
 
         // Parse format: random(16) + msg_len(4) + msg + app_id
         if decrypted.len() < 20 {
@@ -264,7 +273,7 @@ impl WechatCrypto {
             msg_len_bytes[2],
             msg_len_bytes[3],
         ]) as usize;
-        
+
         eprintln!("[DEBUG] Decrypted msg_len: {}", msg_len);
         eprintln!("[DEBUG] Decrypted total len: {}", decrypted.len());
 
@@ -309,22 +318,31 @@ impl WechatCrypto {
         let app_id_bytes = self.app_id.as_bytes();
 
         let total_len = 16 + 4 + msg_bytes.len() + app_id_bytes.len();
-        let block_size = 16usize;
-        let padded_len = total_len.div_ceil(block_size) * block_size;
 
-        let mut buf = vec![0u8; padded_len];
+        // Use 32 byte block size for padding like WeCom does natively
+        let block_size = 32usize;
+        let pad_len = block_size - (total_len % block_size);
+        let final_len = total_len + pad_len;
+
+        let mut buf = vec![0u8; final_len];
         buf[..16].copy_from_slice(&random_bytes);
         buf[16..20].copy_from_slice(&msg_len.to_be_bytes());
         buf[20..20 + msg_bytes.len()].copy_from_slice(msg_bytes);
         buf[20 + msg_bytes.len()..total_len].copy_from_slice(app_id_bytes);
 
-        // AES encrypt
+        // Manual PKCS7 padding
+        for i in total_len..final_len {
+            buf[i] = pad_len as u8;
+        }
+
+        // AES encrypt without standard padding
+        type Aes256CbcEncNoPadding = cbc::Encryptor<aes::Aes256>;
         let iv = &self.encoding_aes_key[..16];
-        let cipher = Aes256CbcEnc::new_from_slices(&self.encoding_aes_key, iv)
+        let cipher = Aes256CbcEncNoPadding::new_from_slices(&self.encoding_aes_key, iv)
             .context("Failed to create AES cipher")?;
 
         let encrypted = cipher
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, total_len)
+            .encrypt_padded_mut::<aes::cipher::block_padding::NoPadding>(&mut buf, final_len)
             .map_err(|_| anyhow!("Failed to encrypt message"))?;
 
         Ok(base64::Engine::encode(
@@ -383,7 +401,7 @@ mod tests {
 #[cfg(test)]
 mod test_real_key {
     use super::*;
-    
+
     #[test]
     fn test_real_wecom_key() {
         let key = "KaxN1fuotvXmSzLOF1TBV7Zi1EfGtyvzHSzW5LToVdO";
