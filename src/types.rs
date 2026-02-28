@@ -159,9 +159,9 @@ pub struct WecomMessage {
     /// CorpID of the enterprise
     #[serde(rename = "ToUserName")]
     pub to_user_name: String,
-    /// UserID of the sender (internal employee)
+    /// UserID of the sender (internal employee) - optional for kf_msg_or_event
     #[serde(rename = "FromUserName")]
-    pub from_user_name: String,
+    pub from_user_name: Option<String>,
     #[serde(rename = "CreateTime")]
     pub create_time: i64,
     #[serde(rename = "MsgType")]
@@ -203,6 +203,10 @@ pub struct WecomMessage {
     pub event_key: Option<String>,
     #[serde(rename = "Ticket")]
     pub ticket: Option<String>,
+    #[serde(rename = "Token")]
+    pub token: Option<String>,
+    #[serde(rename = "OpenKfId")]
+    pub open_kfid: Option<String>,
 }
 
 // =============================================================================
@@ -337,7 +341,7 @@ mod tests {
 
         let msg: WecomMessage = serde_xml_rs::from_str(xml).unwrap();
         assert_eq!(msg.to_user_name, "ww1234567890abcdef");
-        assert_eq!(msg.from_user_name, "zhangsan");
+        assert_eq!(msg.from_user_name, Some("zhangsan".to_string()));
         assert_eq!(msg.msg_type, MsgType::Text);
         assert_eq!(msg.content, Some("Hello".to_string()));
         assert_eq!(msg.agent_id, Some(1000002));
@@ -379,7 +383,7 @@ mod tests {
     fn test_proxy_message_wecom() {
         let wecom_msg = WecomMessage {
             to_user_name: "ww_corp".to_string(),
-            from_user_name: "userid123".to_string(),
+            from_user_name: Some("userid123".to_string()),
             create_time: 1234567890,
             msg_type: MsgType::Text,
             agent_id: Some(1000002),
@@ -400,6 +404,8 @@ mod tests {
             event: None,
             event_key: None,
             ticket: None,
+            token: None,
+            open_kfid: None,
         };
 
         let proxy = ProxyMessage::wecom_inbound("client1", wecom_msg, "<xml/>".to_string());

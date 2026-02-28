@@ -149,7 +149,12 @@ impl MessageBroker {
         let proxy_msg = ProxyMessage::wecom_inbound(&client_id, message.clone(), raw_xml);
 
         let (tx, rx) = oneshot::channel();
-        let user_id = message.from_user_name.clone();
+        // Support regular messages and customer service messages
+        let user_id = message
+            .from_user_name
+            .clone()
+            .or_else(|| message.open_kfid.clone())
+            .unwrap_or_else(|| "unknown".to_string());
         let to_user = message.to_user_name.clone();
         let agent_id = message.agent_id;
 
