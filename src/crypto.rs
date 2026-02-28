@@ -30,11 +30,19 @@ impl WechatCrypto {
 
         // Base64 decode (key has '=' appended for proper padding)
         let key_with_padding = format!("{}=", encoding_aes_key);
+        
+        // Try standard base64 first, then URL-safe
         let decoded = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             &key_with_padding,
         )
-        .context("Failed to decode EncodingAESKey")?;
+        .or_else(|_| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE,
+                &key_with_padding,
+            )
+        })
+        .context("Failed to decode EncodingAESKey - invalid base64 characters")?;
 
         if decoded.len() != 32 {
             return Err(anyhow!(

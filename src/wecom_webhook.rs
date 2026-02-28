@@ -36,8 +36,14 @@ pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow:
     // Create crypto if WeCom encryption is configured
     let crypto = match (&config.wecom_encoding_aes_key, &config.wecom_corp_id) {
         (Some(key), Some(corp_id)) => {
-            info!("WeCom encryption enabled");
-            Some(WechatCrypto::new(key, corp_id)?)
+            info!("WeCom encryption enabled, key_len={}, corp_id={}", key.len(), corp_id);
+            match WechatCrypto::new(key, corp_id) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    error!("Failed to create WeCom crypto: {}", e);
+                    return Err(e);
+                }
+            }
         }
         _ => {
             warn!("WeCom encryption not configured, running in plain mode");
