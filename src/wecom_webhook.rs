@@ -213,7 +213,9 @@ async fn handle_message(
 
     info!(
         "Received WeCom message from user {} (AgentID: {:?}): {:?}",
-        message.from_user_name, message.agent_id, message.content
+        message.from_user_name.as_deref().unwrap_or("unknown"),
+        message.agent_id,
+        message.content
     );
 
     // Forward to broker and wait for response
