@@ -28,6 +28,8 @@ mod crypto;
 mod types;
 mod webhook;
 mod wechat_api;
+mod wecom_api;
+mod wecom_webhook;
 mod ws_manager;
 
 use broker::MessageBroker;
@@ -58,11 +60,29 @@ async fn main() -> Result<()> {
     let webhook_addr: SocketAddr = config.webhook_addr.parse()?;
     let webhook_server = spawn_webhook_server(webhook_addr, broker.clone());
 
+    // Spawn WeCom webhook server if enabled
+    let wecom_server = if config.wecom_enabled {
+        let wecom_addr: SocketAddr = config.wecom_webhook_addr.parse()?;
+        Some(spawn_wecom_server(wecom_addr, broker.clone()))
+    } else {
+        info!("⏭️ WeCom webhook server disabled");
+        None
+    };
+
     // Spawn WebSocket server
     let ws_addr: SocketAddr = config.websocket_addr.parse()?;
     let ws_server = spawn_websocket_server(ws_addr, ws_manager.clone());
 
-    info!("🌐 Webhook server listening on {}", config.webhook_addr);
+    info!(
+        "🌐 WeChat webhook server listening on {}",
+        config.webhook_addr
+    );
+    if config.wecom_enabled {
+        info!(
+            "🏢 WeCom webhook server listening on {}",
+            config.wecom_webhook_addr
+        );
+    }
     info!("🔌 WebSocket server listening on {}", config.websocket_addr);
 
     // Wait for shutdown signal
@@ -74,6 +94,9 @@ async fn main() -> Result<()> {
     // Graceful shutdown
     info!("🛑 Shutting down servers...");
     webhook_server.abort();
+    if let Some(server) = wecom_server {
+        server.abort();
+    }
     ws_server.abort();
 
     info!("✅ UGENT WeChat Proxy stopped");
@@ -100,6 +123,15 @@ fn spawn_websocket_server(
     tokio::spawn(async move {
         if let Err(e) = ws_manager::run_server(addr, ws_manager).await {
             tracing::error!("WebSocket server error: {}", e);
+        }
+    })
+}
+
+/// Spawn the WeCom webhook HTTP server
+fn spawn_wecom_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = wecom_webhook::run_server(addr, broker).await {
+            tracing::error!("WeCom webhook server error: {}", e);
         }
     })
 }

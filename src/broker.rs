@@ -1,9 +1,9 @@
 //! Message broker - connects webhook handlers to WebSocket clients
 //!
 //! Handles:
-//! - Forwarding messages from WeChat to UGENT via WebSocket
-//! - Routing responses back to WeChat
-//! - Async reply via Customer Service API when response times out
+//! - Forwarding messages from WeChat/WeCom to UGENT via WebSocket
+//! - Routing responses back to correct channel
+//! - Async reply via API when response times out
 
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
@@ -14,14 +14,23 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::ProxyConfig;
-use crate::types::{ProxyMessage, WechatMessage};
+use crate::types::{Channel, ProxyMessage, WechatMessage, WecomMessage};
 use crate::wechat_api::{TemplateMessageData, WechatApiClient};
+use crate::wecom_api::WecomApiClient;
 
 /// Pending response tracker
 struct PendingResponse {
+    /// Response channel
     tx: oneshot::Sender<String>,
+    /// Original message sender (WeChat OpenID or WeCom UserID)
     original_from_user: String,
+    /// Original message receiver (WeChat AppID or WeCom CorpID)
     original_to_user: String,
+    /// WeCom AgentID (only for WeCom messages)
+    original_agent_id: Option<i64>,
+    /// Message channel (WeChat or WeCom)
+    channel: Channel,
+    /// When this pending response was created
     created_at: std::time::Instant,
 }
 
@@ -36,6 +45,8 @@ pub struct MessageBroker {
     message_tx: broadcast::Sender<ProxyMessage>,
     /// WeChat API client (for async replies via Customer Service API)
     wechat_api: Option<Arc<WechatApiClient>>,
+    /// WeCom API client (for async replies via Application Message API)
+    wecom_api: Option<Arc<WecomApiClient>>,
 }
 
 impl MessageBroker {
@@ -50,12 +61,27 @@ impl MessageBroker {
                 .map(|secret| Arc::new(WechatApiClient::new(app_id.clone(), secret.clone())))
         });
 
+        // Create WeCom API client if credentials are available
+        let wecom_api = config
+            .wecom_corp_id
+            .as_ref()
+            .zip(config.wecom_corp_secret.as_ref())
+            .zip(config.wecom_agent_id)
+            .map(|((corp_id, corp_secret), agent_id)| {
+                Arc::new(WecomApiClient::new(
+                    corp_id.clone(),
+                    corp_secret.clone(),
+                    agent_id,
+                ))
+            });
+
         Self {
             config,
             pending: Arc::new(DashMap::new()),
             default_client: Arc::new(parking_lot::RwLock::new(None)),
             message_tx,
             wechat_api,
+            wecom_api,
         }
     }
 
@@ -64,68 +90,110 @@ impl MessageBroker {
         self.message_tx.subscribe()
     }
 
-    /// Forward message from WeChat to UGENT and wait for response
+    /// Forward message from WeChat Official Account to UGENT
     pub async fn forward_message(&self, message: WechatMessage, raw_xml: String) -> Result<String> {
-        // Get target client
         let client_id = self.get_target_client()?;
+        let proxy_msg = ProxyMessage::wechat_inbound(&client_id, message.clone(), raw_xml);
 
-        // Create proxy message
-        let proxy_msg = ProxyMessage::inbound(&client_id, message.clone(), raw_xml);
-
-        // Create response channel
         let (tx, rx) = oneshot::channel();
-
-        // Store user OpenID for potential async reply
         let user_openid = message.from_user_name.clone();
         let to_user = message.to_user_name.clone();
 
-        // Register pending response with original message info for response building
         self.pending.insert(
             proxy_msg.id,
             PendingResponse {
                 tx,
                 original_from_user: user_openid.clone(),
                 original_to_user: to_user,
+                original_agent_id: None,
+                channel: Channel::Wechat,
                 created_at: std::time::Instant::now(),
             },
         );
 
-        // Clean up old pending responses
         self.cleanup_old_pending();
 
         debug!(
-            "Forwarding message {} to client {}",
+            "Forwarding WeChat message {} to client {}",
             proxy_msg.id, client_id
         );
 
-        // Broadcast message to all WebSocket clients
         if let Err(e) = self.message_tx.send(proxy_msg.clone()) {
             warn!("Failed to broadcast message to WebSocket clients: {}", e);
             self.pending.remove(&proxy_msg.id);
             return Err(anyhow!("No connected WebSocket clients"));
         }
 
-        // Wait for response with timeout
         let timeout_duration = Duration::from_secs(self.config.message_timeout_secs);
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(response)) => {
-                info!("Got response for message {}", proxy_msg.id);
+                info!("Got response for WeChat message {}", proxy_msg.id);
                 Ok(response)
             }
             Ok(Err(_)) => Err(anyhow!("Response channel closed")),
             Err(_) => {
-                // Remove pending response
                 self.pending.remove(&proxy_msg.id);
-
-                // Try async reply via Customer Service API
-                self.try_async_reply(&user_openid).await;
-
+                self.try_wechat_async_reply(&user_openid).await;
                 Err(anyhow!("Timeout waiting for response"))
             }
         }
     }
 
-    /// Handle response from UGENT client
+    /// Forward message from WeCom (Enterprise WeChat) to UGENT
+    pub async fn forward_wecom_message(
+        &self,
+        message: WecomMessage,
+        raw_xml: String,
+    ) -> Result<String> {
+        let client_id = self.get_target_client()?;
+        let proxy_msg = ProxyMessage::wecom_inbound(&client_id, message.clone(), raw_xml);
+
+        let (tx, rx) = oneshot::channel();
+        let user_id = message.from_user_name.clone();
+        let to_user = message.to_user_name.clone();
+        let agent_id = message.agent_id;
+
+        self.pending.insert(
+            proxy_msg.id,
+            PendingResponse {
+                tx,
+                original_from_user: user_id.clone(),
+                original_to_user: to_user,
+                original_agent_id: agent_id,
+                channel: Channel::Wecom,
+                created_at: std::time::Instant::now(),
+            },
+        );
+
+        self.cleanup_old_pending();
+
+        debug!(
+            "Forwarding WeCom message {} to client {}",
+            proxy_msg.id, client_id
+        );
+
+        if let Err(e) = self.message_tx.send(proxy_msg.clone()) {
+            warn!("Failed to broadcast message to WebSocket clients: {}", e);
+            self.pending.remove(&proxy_msg.id);
+            return Err(anyhow!("No connected WebSocket clients"));
+        }
+
+        let timeout_duration = Duration::from_secs(self.config.message_timeout_secs);
+        match tokio::time::timeout(timeout_duration, rx).await {
+            Ok(Ok(response)) => {
+                info!("Got response for WeCom message {}", proxy_msg.id);
+                Ok(response)
+            }
+            Ok(Err(_)) => Err(anyhow!("Response channel closed")),
+            Err(_) => {
+                self.pending.remove(&proxy_msg.id);
+                self.try_wecom_async_reply(&user_id).await;
+                Err(anyhow!("Timeout waiting for response"))
+            }
+        }
+    }
+
+    /// Handle response from UGENT client (routes to correct channel)
     pub async fn handle_response(
         &self,
         _client_id: &str,
@@ -134,14 +202,21 @@ impl MessageBroker {
     ) -> Result<()> {
         debug!("Received response for message {} from client", original_id);
 
-        // Find and complete pending response
         if let Some((_, pending)) = self.pending.remove(&original_id) {
-            // Build proper WeChat response XML
-            let response_xml = build_wechat_response(
-                &pending.original_to_user,
-                &pending.original_from_user,
-                &content,
-            );
+            // Build response based on channel
+            let response_xml = match pending.channel {
+                Channel::Wechat => build_wechat_response(
+                    &pending.original_to_user,
+                    &pending.original_from_user,
+                    &content,
+                ),
+                Channel::Wecom => build_wecom_response(
+                    &pending.original_to_user,
+                    &pending.original_from_user,
+                    pending.original_agent_id,
+                    &content,
+                ),
+            };
 
             if pending.tx.send(response_xml).is_err() {
                 warn!("Failed to send response - channel closed");
@@ -153,80 +228,90 @@ impl MessageBroker {
         Ok(())
     }
 
-    /// Try to send async reply via Customer Service API
-    ///
-    /// This is called when UGENT doesn't respond within the timeout window.
-    /// Customer Service API can send messages within 48h of user's last message.
-    async fn try_async_reply(&self, user_openid: &str) {
+    /// Try async reply via WeChat Customer Service API
+    async fn try_wechat_async_reply(&self, user_openid: &str) {
         if let Some(ref api) = self.wechat_api {
             info!(
-                "Attempting async reply via Customer Service API to user {}",
+                "Attempting async reply via WeChat Customer Service API to user {}",
                 user_openid
             );
 
-            // Send a "thinking" or "processing" message
             let message = "您的消息已收到，正在处理中，请稍候...";
             match api.send_custom_text_message(user_openid, message).await {
                 Ok(result) if result.errcode == 0 => {
-                    info!("Async reply sent successfully to {}", user_openid);
+                    info!("WeChat async reply sent successfully to {}", user_openid);
                 }
                 Ok(result) => {
-                    // Error codes:
-                    // 40001: Invalid access token
-                    // 45015: Reply time limit exceeded (48h)
-                    // 45047: Customer service message limit exceeded
                     warn!(
-                        "Failed to send async reply: {} - {}",
+                        "Failed to send WeChat async reply: {} - {}",
                         result.errcode, result.errmsg
                     );
-
-                    // If within 48h window but failed, try template message
                     if result.errcode == 45047 {
                         self.try_template_notification(user_openid).await;
                     }
                 }
                 Err(e) => {
-                    error!("Error sending async reply: {}", e);
+                    error!("Error sending WeChat async reply: {}", e);
                 }
             }
-        } else {
-            warn!("WeChat API client not configured, cannot send async reply");
         }
     }
 
-    /// Try to send notification via template message
-    ///
-    /// Used when Customer Service API fails (e.g., rate limited)
+    /// Try template notification (fallback when Customer Service API fails)
     async fn try_template_notification(&self, user_openid: &str) {
-        if let Some(ref api) = self.wechat_api {
-            if let Some(ref template_id) = self.config.template_id_response_ready {
-                info!("Attempting template notification to user {}", user_openid);
+        if let Some(ref api) = self.wechat_api
+            && let Some(ref template_id) = self.config.template_id_response_ready
+        {
+            info!("Attempting template notification to user {}", user_openid);
 
-                let data = TemplateMessageData::new()
-                    .add_field("first", "AI回复已生成", Some("#173177"))
-                    .add_field("keyword1", "UGENT助手", None)
-                    .add_field("keyword2", "点击查看回复", None)
-                    .add_field("remark", "感谢您的耐心等待", None);
+            let data = TemplateMessageData::new()
+                .add_field("first", "AI回复已生成", Some("#173177"))
+                .add_field("keyword1", "UGENT助手", None)
+                .add_field("keyword2", "点击查看回复", None)
+                .add_field("remark", "感谢您的耐心等待", None);
 
-                match api
-                    .send_template_message(user_openid, template_id, &data, None)
-                    .await
-                {
-                    Ok(result) if result.errcode == 0 => {
-                        info!("Template notification sent successfully to {}", user_openid);
-                    }
-                    Ok(result) => {
-                        warn!(
-                            "Failed to send template notification: {} - {}",
-                            result.errcode, result.errmsg
-                        );
-                    }
-                    Err(e) => {
-                        error!("Error sending template notification: {}", e);
-                    }
+            match api
+                .send_template_message(user_openid, template_id, &data, None)
+                .await
+            {
+                Ok(result) if result.errcode == 1 => {
+                    info!("Template notification sent successfully to {}", user_openid);
                 }
-            } else {
-                warn!("Template ID not configured, cannot send template notification");
+                Ok(result) => {
+                    warn!(
+                        "Failed to send template notification: {} - {}",
+                        result.errcode, result.errmsg
+                    );
+                }
+                Err(e) => {
+                    error!("Error sending template notification: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Try async reply via WeCom Application Message API
+    async fn try_wecom_async_reply(&self, user_id: &str) {
+        if let Some(ref api) = self.wecom_api {
+            info!(
+                "Attempting async reply via WeCom Application Message API to user {}",
+                user_id
+            );
+
+            let message = "您的消息已收到，正在处理中，请稍候...";
+            match api.send_text_message(user_id, message).await {
+                Ok(result) if result.errcode == 1 => {
+                    info!("WeCom async reply sent successfully to {}", user_id);
+                }
+                Ok(result) => {
+                    warn!(
+                        "Failed to send WeCom async reply: {} - {}",
+                        result.errcode, result.errmsg
+                    );
+                }
+                Err(e) => {
+                    error!("Error sending WeCom async reply: {}", e);
+                }
             }
         }
     }
@@ -266,17 +351,6 @@ impl MessageBroker {
 }
 
 /// Build WeChat response XML
-///
-/// Format:
-/// ```xml
-/// <xml>
-///   <ToUserName><![CDATA[to_user]]></ToUserName>
-///   <FromUserName><![CDATA[from_user]]></FromUserName>
-///   <CreateTime>timestamp</CreateTime>
-///   <MsgType><![CDATA[text]]></MsgType>
-///   <Content><![CDATA[content]]></Content>
-/// </xml>
-/// ```
 fn build_wechat_response(to_user: &str, from_user: &str, content: &str) -> String {
     let timestamp = chrono::Utc::now().timestamp();
     format!(
@@ -291,6 +365,32 @@ fn build_wechat_response(to_user: &str, from_user: &str, content: &str) -> Strin
     )
 }
 
+/// Build WeCom response XML
+///
+/// Note: WeCom requires AgentID in the response
+fn build_wecom_response(
+    to_user: &str,
+    from_user: &str,
+    agent_id: Option<i64>,
+    content: &str,
+) -> String {
+    let timestamp = chrono::Utc::now().timestamp();
+    let agent_xml = agent_id
+        .map(|id| format!("  <AgentID>{}</AgentID>\n", id))
+        .unwrap_or_default();
+
+    format!(
+        r#"<xml>
+  <ToUserName><![CDATA[{}]]></ToUserName>
+  <FromUserName><![CDATA[{}]]></FromUserName>
+  <CreateTime>{}</CreateTime>
+  <MsgType><![CDATA[text]]></MsgType>
+  <Content><![CDATA[{}]]></Content>
+{}</xml>"#,
+        to_user, from_user, timestamp, content, agent_xml
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +402,22 @@ mod tests {
         assert!(response.contains("<FromUserName><![CDATA[gh_abc123]]></FromUserName>"));
         assert!(response.contains("<Content><![CDATA[Hello!]]></Content>"));
         assert!(response.contains("<MsgType><![CDATA[text]]></MsgType>"));
+        assert!(!response.contains("<AgentID>"));
+    }
+
+    #[test]
+    fn test_build_wecom_response_with_agent_id() {
+        let response = build_wecom_response("ww_corp", "zhangsan", Some(1000002), "Hello!");
+        assert!(response.contains("<ToUserName><![CDATA[ww_corp]]></ToUserName>"));
+        assert!(response.contains("<FromUserName><![CDATA[zhangsan]]></FromUserName>"));
+        assert!(response.contains("<Content><![CDATA[Hello!]]></Content>"));
+        assert!(response.contains("<AgentID>1000002</AgentID>"));
+    }
+
+    #[test]
+    fn test_build_wecom_response_without_agent_id() {
+        let response = build_wecom_response("ww_corp", "zhangsan", None, "Hello!");
+        assert!(response.contains("<ToUserName><![CDATA[ww_corp]]></ToUserName>"));
+        assert!(!response.contains("<AgentID>"));
     }
 }

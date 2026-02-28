@@ -7,6 +7,9 @@ use std::collections::HashSet;
 /// Proxy server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
+    // =========================================================================
+    // WeChat Official Account (公众号) Configuration
+    // =========================================================================
     /// WeChat token for signature verification
     pub wechat_token: String,
 
@@ -22,10 +25,39 @@ pub struct ProxyConfig {
     /// Template ID for "Response Ready" notification
     pub template_id_response_ready: Option<String>,
 
-    /// Webhook server bind address (receives from WeChat)
+    /// Webhook server bind address (receives from WeChat OA)
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
 
+    // =========================================================================
+    // WeCom (企业微信) Configuration
+    // =========================================================================
+    /// Enable WeCom support
+    #[serde(default)]
+    pub wecom_enabled: bool,
+
+    /// WeCom token for signature verification
+    pub wecom_token: Option<String>,
+
+    /// WeCom EncodingAESKey (43 characters)
+    pub wecom_encoding_aes_key: Option<String>,
+
+    /// WeCom CorpID (enterprise ID)
+    pub wecom_corp_id: Option<String>,
+
+    /// WeCom AgentID (application ID)
+    pub wecom_agent_id: Option<i64>,
+
+    /// WeCom CorpSecret (for API calls)
+    pub wecom_corp_secret: Option<String>,
+
+    /// WeCom webhook server bind address
+    #[serde(default = "default_wecom_webhook_addr")]
+    pub wecom_webhook_addr: String,
+
+    // =========================================================================
+    // Common Configuration
+    // =========================================================================
     /// WebSocket server bind address (UGENT connects here)
     #[serde(default = "default_websocket_addr")]
     pub websocket_addr: String,
@@ -58,6 +90,10 @@ fn default_webhook_addr() -> String {
     "0.0.0.0:8080".to_string()
 }
 
+fn default_wecom_webhook_addr() -> String {
+    "0.0.0.0:8082".to_string()
+}
+
 fn default_websocket_addr() -> String {
     "0.0.0.0:8081".to_string()
 }
@@ -84,12 +120,27 @@ impl ProxyConfig {
         let api_key = std::env::var("PROXY_API_KEY").context("PROXY_API_KEY is required")?;
 
         Ok(Self {
+            // WeChat OA config
             wechat_token,
             wechat_encoding_aes_key: std::env::var("WECHAT_ENCODING_AES_KEY").ok(),
             wechat_app_id: std::env::var("WECHAT_APP_ID").ok(),
             wechat_app_secret: std::env::var("WECHAT_APP_SECRET").ok(),
             template_id_response_ready: std::env::var("WECHAT_TEMPLATE_RESPONSE_READY").ok(),
             webhook_addr: std::env::var("WEBHOOK_ADDR").unwrap_or_else(|_| default_webhook_addr()),
+
+            // WeCom config
+            wecom_enabled: std::env::var("WECOM_ENABLED").is_ok(),
+            wecom_token: std::env::var("WECOM_TOKEN").ok(),
+            wecom_encoding_aes_key: std::env::var("WECOM_ENCODING_AES_KEY").ok(),
+            wecom_corp_id: std::env::var("WECOM_CORP_ID").ok(),
+            wecom_agent_id: std::env::var("WECOM_AGENT_ID")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            wecom_corp_secret: std::env::var("WECOM_CORP_SECRET").ok(),
+            wecom_webhook_addr: std::env::var("WECOM_WEBHOOK_ADDR")
+                .unwrap_or_else(|_| default_wecom_webhook_addr()),
+
+            // Common config
             websocket_addr: std::env::var("WEBSOCKET_ADDR")
                 .unwrap_or_else(|_| default_websocket_addr()),
             api_key,

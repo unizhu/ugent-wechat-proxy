@@ -66,6 +66,7 @@ prometheus = { version = "0.13", optional = true }
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
+serde_urlencoded = "0.7"
 
 [features]
 default = []
