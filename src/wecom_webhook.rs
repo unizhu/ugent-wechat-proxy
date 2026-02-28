@@ -36,7 +36,11 @@ pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow:
     // Create crypto if WeCom encryption is configured
     let crypto = match (&config.wecom_encoding_aes_key, &config.wecom_corp_id) {
         (Some(key), Some(corp_id)) => {
-            info!("WeCom encryption enabled, key_len={}, corp_id={}", key.len(), corp_id);
+            info!(
+                "WeCom encryption enabled, key_len={}, corp_id={}",
+                key.len(),
+                corp_id
+            );
             match WechatCrypto::new(key, corp_id) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -84,8 +88,11 @@ async fn verify_url(
     State(state): State<WecomWebhookState>,
 ) -> Result<String, StatusCode> {
     debug!(
-        "WeCom URL verification: signature={}, timestamp={}, nonce={}",
-        params.msg_signature, params.timestamp, params.nonce
+        "WeCom URL verification: msg_signature={}, timestamp={}, nonce={}, echostr_len={}",
+        params.msg_signature,
+        params.timestamp,
+        params.nonce,
+        params.echostr.len()
     );
 
     let token = state
@@ -94,11 +101,21 @@ async fn verify_url(
         .as_ref()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Verify signature using token
-    let signature = WechatCrypto::sign(token, &params.timestamp, &params.nonce);
+    // Verify signature: msg_signature = SHA1(sort(token, timestamp, nonce, echostr))
+    // This is DIFFERENT from the basic sign() which only uses token, timestamp, nonce
+    let is_valid = WechatCrypto::verify_message(
+        token,
+        &params.timestamp,
+        &params.nonce,
+        &params.echostr,
+        &params.msg_signature,
+    );
 
-    if signature != params.msg_signature {
-        warn!("WeCom signature verification failed");
+    if !is_valid {
+        warn!(
+            "WeCom URL signature verification failed: expected_signature={}, token={}",
+            params.msg_signature, token
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -106,8 +123,12 @@ async fn verify_url(
     if let Some(crypto) = &state.crypto {
         match crypto.decrypt(&params.echostr) {
             Ok(decrypted) => {
-                info!("WeCom URL verification successful");
+                info!(
+                    "WeCom URL verification successful, decrypted_len={}",
+                    decrypted.len()
+                );
                 // Return decrypted content (must be exact, no quotes)
+                // Content-Type is automatically text/plain for String return type
                 Ok(decrypted)
             }
             Err(e) => {
@@ -151,11 +172,21 @@ async fn handle_message(
         .as_ref()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Verify signature
-    let signature = WechatCrypto::sign(token, &params.timestamp, &params.nonce);
+    // Verify signature: msg_signature = SHA1(sort(token, timestamp, nonce, encrypted_msg))
+    // This is DIFFERENT from basic sign() which only uses token, timestamp, nonce
+    let is_valid = WechatCrypto::verify_message(
+        token,
+        &params.timestamp,
+        &params.nonce,
+        &encrypted.encrypt,
+        &params.msg_signature,
+    );
 
-    if signature != params.msg_signature {
-        warn!("WeCom message signature verification failed");
+    if !is_valid {
+        warn!(
+            "WeCom message signature verification failed: msg_signature={}",
+            params.msg_signature
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
