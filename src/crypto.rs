@@ -56,75 +56,25 @@ impl WechatCrypto {
         })
     }
 
-    /// Decode WeCom's non-standard base64 key
+        /// Decode WeCom's non-standard base64 key
     ///
     /// WeCom uses 43 base64 characters which is non-standard.
-    /// - 42 chars = 42 * 6 = 252 bits = 31.5 bytes
-    /// - 43rd char provides 2 more bits = 254 bits = 31.75 bytes
-    /// - WeChat expects 32 bytes, so we decode leniently
+    /// Standard base64 encodes 32 bytes as 44 chars (with padding).
+    /// WeCom removes the trailing '=' padding, leaving 43 chars.
+    ///
+    /// Solution: Add back the '=' padding and decode normally.
     fn decode_wecom_key(key: &str) -> Result<Vec<u8>> {
-        fn char_to_val(c: char) -> Option<u8> {
-            match c {
-                'A'..='Z' => Some((c as u8) - b'A'),
-                'a'..='z' => Some((c as u8) - b'a' + 26),
-                '0'..='9' => Some((c as u8) - b'0' + 52),
-                '+' => Some(62),
-                '/' => Some(63),
-                _ => None,
-            }
+        // Pad with '=' to make valid base64
+        let padded = format!("{}=", key);
+        
+        let decoded = base64::Engine::decode(&general_purpose::STANDARD, &padded)
+            .context("Failed to decode EncodingAESKey")?;
+        
+        if decoded.len() != 32 {
+            return Err(anyhow!("Decoded key to {} bytes, expected 32", decoded.len()));
         }
 
-        let bytes = key.as_bytes();
-        let mut result = Vec::with_capacity(32);
-
-        // Process 4 characters at a time to produce 3 bytes
-        let chunks = bytes.chunks_exact(4);
-        let remainder = chunks.remainder();
-
-        for chunk in chunks {
-            let v0 = char_to_val(chunk[0] as char)
-                .ok_or_else(|| anyhow!("Invalid char: {}", chunk[0] as char))?;
-            let v1 = char_to_val(chunk[1] as char)
-                .ok_or_else(|| anyhow!("Invalid char: {}", chunk[1] as char))?;
-            let v2 = char_to_val(chunk[2] as char)
-                .ok_or_else(|| anyhow!("Invalid char: {}", chunk[2] as char))?;
-            let v3 = char_to_val(chunk[3] as char)
-                .ok_or_else(|| anyhow!("Invalid char: {}", chunk[3] as char))?;
-
-            // 4 x 6-bit values -> 3 bytes
-            result.push((v0 << 2) | (v1 >> 4));
-            result.push((v1 << 4) | (v2 >> 2));
-            result.push((v2 << 6) | v3);
-        }
-
-        // Handle remainder (43 chars = 10 full chunks + 3 remainder chars)
-        // Remainder: 3 chars = 18 bits, but we only need 16 bits (2 bytes) for 32 total
-        if remainder.len() >= 2 {
-            let v0 = char_to_val(remainder[0] as char)
-                .ok_or_else(|| anyhow!("Invalid char: {}", remainder[0] as char))?;
-            let v1 = char_to_val(remainder[1] as char)
-                .ok_or_else(|| anyhow!("Invalid char: {}", remainder[1] as char))?;
-
-            // First byte from first 2 chars
-            result.push((v0 << 2) | (v1 >> 4));
-
-            // Second byte: we only have 4 bits from v1, need 2 more bits from v2 if present
-            if remainder.len() >= 3 {
-                let v2 = char_to_val(remainder[2] as char)
-                    .ok_or_else(|| anyhow!("Invalid char: {}", remainder[2] as char))?;
-                // v2 contributes only its top 2 bits (ignore remaining 4 bits)
-                result.push((v1 << 4) | (v2 >> 2));
-            } else {
-                // Only 2 remainder chars: v1 provides only 4 bits, pad with zeros
-                result.push((v1 << 4) & 0xF0); // Upper 4 bits from v1, lower 4 bits zero
-            }
-        }
-
-        if result.len() != 32 {
-            return Err(anyhow!("Decoded to {} bytes, expected 32", result.len()));
-        }
-
-        Ok(result)
+        Ok(decoded)
     }
 
     /// Verify WeChat signature
@@ -161,7 +111,7 @@ impl WechatCrypto {
         hex::encode(hash) == msg_signature
     }
 
-    /// Decrypt WeChat message
+        /// Decrypt WeChat message
     ///
     /// Format: random(16) + msg_len(4) + msg + app_id
     pub fn decrypt(&self, encrypted: &str) -> Result<String> {
@@ -170,11 +120,23 @@ impl WechatCrypto {
             .context("Failed to base64 decode encrypted message")?;
 
         if encrypted_bytes.len() < 32 {
-            return Err(anyhow!("Encrypted message too short"));
+            return Err(anyhow!(
+                "Encrypted message too short: {} bytes",
+                encrypted_bytes.len()
+            ));
         }
 
-        // AES-256-CBC decrypt with key as IV (WeChat uses key as IV)
-        // WeChat uses first 16 bytes of key as IV
+        // Check if encrypted length is multiple of 16 (AES block size)
+        if encrypted_bytes.len() % 16 != 0 {
+            return Err(anyhow!(
+                "Encrypted message length not multiple of 16: {} bytes",
+                encrypted_bytes.len()
+            ));
+        }
+
+        // AES-256-CBC decrypt
+        // WeChat/WeCom uses IV = first 16 bytes of the key (NOT zeros!)
+        // See: https://developer.work.weixin.qq.com/document/path/90968
         let iv = &self.encoding_aes_key[..16];
         let cipher = Aes256CbcDec::new_from_slices(&self.encoding_aes_key, iv)
             .context("Failed to create AES cipher")?;
@@ -183,13 +145,16 @@ impl WechatCrypto {
         let mut buf = encrypted_bytes.clone();
         let decrypted = cipher
             .decrypt_padded_mut::<Pkcs7>(&mut buf)
-            .map_err(|_| anyhow!("Failed to decrypt message"))?;
+            .map_err(|e| anyhow!("Failed to decrypt message (PKCS7 padding error): {:?}", e))?;
 
         let decrypted = decrypted.to_vec();
 
         // Parse format: random(16) + msg_len(4) + msg + app_id
         if decrypted.len() < 20 {
-            return Err(anyhow!("Decrypted message too short"));
+            return Err(anyhow!(
+                "Decrypted message too short: {} bytes",
+                decrypted.len()
+            ));
         }
 
         // Skip 16 bytes random
@@ -202,7 +167,11 @@ impl WechatCrypto {
         ]) as usize;
 
         if decrypted.len() < 20 + msg_len {
-            return Err(anyhow!("Invalid message length"));
+            return Err(anyhow!(
+                "Invalid message length: declared {} bytes but only have {} bytes",
+                msg_len,
+                decrypted.len() - 20
+            ));
         }
 
         let msg = &decrypted[20..20 + msg_len];
@@ -210,7 +179,11 @@ impl WechatCrypto {
 
         // Verify app_id
         if app_id_in_msg != self.app_id.as_bytes() {
-            return Err(anyhow!("AppID mismatch in decrypted message"));
+            return Err(anyhow!(
+                "AppID mismatch in decrypted message: expected '{}', got '{}'",
+                self.app_id,
+                String::from_utf8_lossy(app_id_in_msg)
+            ));
         }
 
         String::from_utf8(msg.to_vec()).context("Failed to convert message to UTF-8")
