@@ -13,11 +13,11 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::broker::MessageBroker;
-use crate::types::WsMessage;
+use crate::types::{ProxyMessage, WsMessage};
 
 /// WebSocket manager state
 #[derive(Clone)]
@@ -84,14 +84,14 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Channel for outgoing messages
+    // Channel for outgoing messages to this client
     let (tx, mut rx) = mpsc::channel::<WsMessage>(32);
 
     // State for this connection
     let mut authenticated = false;
     let mut client_id: Option<String> = None;
 
-    // Task to send outgoing messages
+    // Task to send outgoing messages to WebSocket
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let json = serde_json::to_string(&msg).unwrap();
@@ -140,6 +140,14 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                                     authenticated = true;
                                     client_id = Some(data.client_id.clone());
                                     ws_manager.add_client(data.client_id.clone(), addr, tx.clone());
+
+                                    // Subscribe to broker messages for this client
+                                    let broker_rx = ws_manager.broker.subscribe();
+                                    let tx_clone = tx.clone();
+                                    let cid = data.client_id.clone();
+                                    tokio::spawn(async move {
+                                        handle_broker_messages(broker_rx, tx_clone, cid).await;
+                                    });
 
                                     let _ = tx
                                         .send(WsMessage::AuthResult {
@@ -214,4 +222,43 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
     }
 
     send_task.abort();
+}
+
+/// Handle incoming messages from broker and forward to WebSocket client
+async fn handle_broker_messages(
+    mut broker_rx: broadcast::Receiver<ProxyMessage>,
+    tx: mpsc::Sender<WsMessage>,
+    client_id: String,
+) {
+    loop {
+        match broker_rx.recv().await {
+            Ok(proxy_msg) => {
+                // Only forward messages meant for this client
+                if proxy_msg.client_id == client_id {
+                    debug!(
+                        "Forwarding message {} to client {}",
+                        proxy_msg.id, client_id
+                    );
+                    if tx
+                        .send(WsMessage::Message {
+                            data: Box::new(proxy_msg),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        debug!("Client {} disconnected, stopping broker handler", client_id);
+                        break;
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                debug!("Broker channel closed for client {}", client_id);
+                break;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("Client {} lagged behind by {} messages", client_id, n);
+                // Continue processing, lagged messages are dropped
+            }
+        }
+    }
 }

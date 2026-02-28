@@ -9,9 +9,10 @@ A public-facing proxy server that bridges WeChat Official Account webhooks to lo
 │   WeChat    │  HTTPS  │  ugent-wechat-proxy      │
 │   Server    │ ───────▶│  (Public VPS)            │
 └─────────────┘         │                          │
-                        │  • HTTPS webhook (8080)  │
-                        │  • WebSocket (8081)      │
+                        │  • Webhook server (8080) │
+                        │  • WebSocket server(8081)│
                         │  • Message broker        │
+                        │  • Async reply support   │
                         └────────────┬─────────────┘
                                      │
                         WebSocket (bidirectional)
@@ -30,8 +31,9 @@ A public-facing proxy server that bridges WeChat Official Account webhooks to lo
 - ✅ AES-256-CBC message encryption/decryption
 - ✅ WebSocket server for UGENT connections
 - ✅ API key authentication
-- ✅ Rate limiting
-- ✅ Bidirectional messaging
+- ✅ Bidirectional messaging with broadcast
+- ✅ **Async reply via Customer Service API** (48h window)
+- ✅ **Template Message fallback** (for delayed notifications)
 
 ## Quick Start
 
@@ -44,17 +46,10 @@ cargo install --path .
 ### 2. Configure Environment
 
 ```bash
-# Required
-export WECHAT_TOKEN=your_wechat_token
-export PROXY_API_KEY=your_secure_api_key
-
-# Optional (for encrypted messages)
-export WECHAT_ENCODING_AES_KEY=your_43_char_key
-export WECHAT_APP_ID=wx1234567890abcdef
-
-# Server configuration
-export WEBHOOK_ADDR=0.0.0.0:8080
-export WEBSOCKET_ADDR=0.0.0.0:8081
+# Copy example config
+cp .env.example .env
+# Edit with your values
+vim .env
 ```
 
 ### 3. Run
@@ -90,17 +85,34 @@ UGENT connects via WebSocket to receive messages:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `WECHAT_TOKEN` | ✅ | - | WeChat token for signature |
-| `PROXY_API_KEY` | ✅ | - | API key for UGENT clients |
+| `WECHAT_TOKEN` | ✅ | - | WeChat token for signature verification |
+| `PROXY_API_KEY` | ✅ | - | API key for UGENT WebSocket clients |
 | `WECHAT_ENCODING_AES_KEY` | ❌ | - | 43-char AES key (security mode) |
 | `WECHAT_APP_ID` | ❌ | - | WeChat AppID (for decryption) |
+| `WECHAT_APP_SECRET` | ❌ | - | AppSecret (for async reply API) |
+| `WECHAT_TEMPLATE_RESPONSE_READY` | ❌ | - | Template ID for delayed notifications |
 | `WEBHOOK_ADDR` | ❌ | `0.0.0.0:8080` | Webhook bind address |
 | `WEBSOCKET_ADDR` | ❌ | `0.0.0.0:8081` | WebSocket bind address |
 | `ALLOWED_CLIENTS` | ❌ | (all) | Comma-separated client IDs |
-| `MESSAGE_TIMEOUT_SECS` | ❌ | `5` | Response timeout |
-| `MAX_CONNECTIONS_PER_CLIENT` | ❌ | `10` | Max WS connections |
-| `RATE_LIMIT` | ❌ | `100` | Messages per minute |
+| `MESSAGE_TIMEOUT_SECS` | ❌ | `5` | Response timeout (WeChat limit) |
+| `MAX_CONNECTIONS_PER_CLIENT` | ❌ | `10` | Max WS connections per client |
+| `RATE_LIMIT` | ❌ | `100` | Messages per minute per client |
 | `DEBUG_MODE` | ❌ | `false` | Enable debug logging |
+
+## Async Reply Flow
+
+When UGENT doesn't respond within the timeout (5s), the proxy automatically:
+
+1. **Customer Service API** - Sends "processing" message (works within 48h of user's last message)
+2. **Template Message** - Fallback if rate limited (requires template configuration)
+
+```
+WeChat msg → Proxy → UGENT (5s timeout)
+                    ↓ (timeout)
+         Customer Service API reply
+                    ↓ (if rate limited)
+           Template Message notification
+```
 
 ## Deployment
 
@@ -133,80 +145,45 @@ server {
 
 ### With Docker
 
-```dockerfile
-FROM rust:1.75 as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/ugent-wechat-proxy /usr/local/bin/
-CMD ["ugent-wechat-proxy"]
-```
-
 ```bash
+# Build
 docker build -t ugent-wechat-proxy .
-docker run -p 8080:8080 -p 8081:8081 \
-  -e WECHAT_TOKEN=xxx \
-  -e PROXY_API_KEY=xxx \
+
+# Run
+docker run -d \
+  --name wechat-proxy \
+  -p 8080:8080 \
+  -p 8081:8081 \
+  --env-file .env \
   ugent-wechat-proxy
 ```
 
-## Protocol
+### Systemd Service
 
-### WebSocket Message Types
+```ini
+[Unit]
+Description=UGENT WeChat Proxy
+After=network.target
 
-#### Authentication
-```json
-// Request
-{"type": "auth", "data": {"client_id": "ugent-1", "api_key": "secret"}}
+[Service]
+Type=simple
+User=ugent
+WorkingDirectory=/opt/ugent-wechat-proxy
+EnvironmentFile=/opt/ugent-wechat-proxy/.env
+ExecStart=/usr/local/bin/ugent-wechat-proxy
+Restart=always
+RestartSec=5
 
-// Response
-{"type": "auth_result", "success": true, "message": "Authenticated"}
+[Install]
+WantedBy=multi-user.target
 ```
 
-#### Incoming Message
-```json
-{
-  "type": "message",
-  "data": {
-    "id": "uuid",
-    "timestamp": "2026-01-01T00:00:00Z",
-    "direction": "inbound",
-    "client_id": "ugent-1",
-    "wechat_message": {
-      "to_user_name": "gh_xxx",
-      "from_user_name": "openid_xxx",
-      "create_time": 1234567890,
-      "msg_type": "text",
-      "content": "Hello"
-    },
-    "raw_xml": "<xml>...</xml>"
-  }
-}
-```
+## Security Notes
 
-#### Response
-```json
-{"type": "response", "original_id": "uuid", "content": "Reply text"}
-```
-
-#### Heartbeat
-```json
-// Request
-{"type": "ping"}
-
-// Response
-{"type": "pong"}
-```
-
-## Security
-
-1. **WeChat Verification**: SHA1 signature validation
-2. **Message Encryption**: AES-256-CBC (security mode)
-3. **API Key Auth**: All WebSocket clients must authenticate
-4. **Client Allowlist**: Optional restriction of client IDs
-5. **Rate Limiting**: Configurable per-client rate limits
+- Always use HTTPS in production (nginx + Let's Encrypt)
+- Keep `PROXY_API_KEY` and `WECHAT_APP_SECRET` secure
+- Use `WECHAT_ENCODING_AES_KEY` for message encryption (security mode)
+- Restrict `ALLOWED_CLIENTS` to known client IDs
 
 ## License
 

@@ -47,12 +47,14 @@ pub mod config;
 pub mod crypto;
 pub mod types;
 pub mod webhook;
+pub mod wechat_api;
 pub mod ws_manager;
 
 pub use broker::MessageBroker;
 pub use config::ProxyConfig;
 pub use crypto::WechatCrypto;
 pub use types::*;
+pub use wechat_api::WechatApiClient;
 pub use ws_manager::WebSocketManager;
 
 /// Prelude for common imports

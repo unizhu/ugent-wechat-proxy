@@ -16,6 +16,12 @@ pub struct ProxyConfig {
     /// WeChat AppID
     pub wechat_app_id: Option<String>,
 
+    /// WeChat AppSecret (for API calls like template messages)
+    pub wechat_app_secret: Option<String>,
+
+    /// Template ID for "Response Ready" notification
+    pub template_id_response_ready: Option<String>,
+
     /// Webhook server bind address (receives from WeChat)
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
@@ -81,6 +87,8 @@ impl ProxyConfig {
             wechat_token,
             wechat_encoding_aes_key: std::env::var("WECHAT_ENCODING_AES_KEY").ok(),
             wechat_app_id: std::env::var("WECHAT_APP_ID").ok(),
+            wechat_app_secret: std::env::var("WECHAT_APP_SECRET").ok(),
+            template_id_response_ready: std::env::var("WECHAT_TEMPLATE_RESPONSE_READY").ok(),
             webhook_addr: std::env::var("WEBHOOK_ADDR").unwrap_or_else(|_| default_webhook_addr()),
             websocket_addr: std::env::var("WEBSOCKET_ADDR")
                 .unwrap_or_else(|_| default_websocket_addr()),

@@ -27,6 +27,7 @@ mod config;
 mod crypto;
 mod types;
 mod webhook;
+mod wechat_api;
 mod ws_manager;
 
 use broker::MessageBroker;
