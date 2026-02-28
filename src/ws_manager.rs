@@ -4,6 +4,7 @@ use axum::{
     Router,
     extract::{
         State,
+        ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::Response,
@@ -60,7 +61,8 @@ impl WebSocketManager {
 pub async fn run_server(addr: SocketAddr, ws_manager: Arc<WebSocketManager>) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/ws", get(websocket_handler))
-        .with_state(ws_manager);
+        .with_state(ws_manager)
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
@@ -73,9 +75,9 @@ pub async fn run_server(addr: SocketAddr, ws_manager: Arc<WebSocketManager>) -> 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(ws_manager): State<Arc<WebSocketManager>>,
-    connect_info: axum::extract::ConnectInfo<SocketAddr>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, ws_manager, connect_info.0))
+    ws.on_upgrade(move |socket| handle_socket(socket, ws_manager, addr))
 }
 
 /// Handle WebSocket connection
