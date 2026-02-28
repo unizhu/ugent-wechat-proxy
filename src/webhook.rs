@@ -2,9 +2,11 @@
 
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Query, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::get,
 };
 use std::net::SocketAddr;
@@ -42,8 +44,10 @@ pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow:
     };
 
     let app = Router::new()
+        // WeChat webhook endpoint
         .route("/wechat/webhook", get(verify).post(handle_message))
         .route("/health", get(health_check))
+        .layer(middleware::from_fn(log_request))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -57,12 +61,30 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+/// Middleware to log all incoming HTTP requests
+async fn log_request(req: Request<Body>, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    
+    info!("🌐 HTTP {} {}{}", method, uri.path(), query);
+    
+    let response = next.run(req).await;
+    
+    info!("📤 Response status: {}", response.status());
+    
+    response
+}
+
 /// Webhook verification (GET request from WeChat)
 async fn verify(
     State(state): State<WebhookState>,
     Query(params): Query<VerifyParams>,
 ) -> Result<String, StatusCode> {
-    info!("Received verification request from WeChat");
+    info!(
+        "📥 Received verification request from WeChat: timestamp={}, nonce={}, signature={}",
+        params.timestamp, params.nonce, params.signature
+    );
 
     if !WechatCrypto::verify(
         &state.config.wechat_token,
@@ -84,7 +106,11 @@ async fn handle_message(
     Query(params): Query<EncryptedParams>,
     body: Bytes,
 ) -> Result<String, StatusCode> {
-    debug!("Received message from WeChat");
+    info!(
+        "📥 Received message from WeChat: timestamp={}, nonce={}, signature={}, encrypt_type={:?}",
+        params.timestamp, params.nonce, params.signature, params.encrypt_type
+    );
+    debug!("Request body length: {} bytes", body.len());
 
     // Verify signature
     if !WechatCrypto::verify(
