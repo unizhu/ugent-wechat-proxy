@@ -35,6 +35,135 @@ struct WecomTokenResponse {
     expires_in: Option<u64>,
 }
 
+/// KF sync_msg request
+#[derive(Debug, Clone, Serialize)]
+struct KfSyncMsgRequest {
+    /// Callback token (10 min valid)
+    token: String,
+    /// Customer service account ID (required!)
+    open_kfid: String,
+    /// Cursor for pagination (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    /// Limit (default 1000)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u32>,
+}
+
+/// KF sync_msg response
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfSyncMsgResponse {
+    pub errcode: i64,
+    pub errmsg: String,
+    /// Next cursor for pagination
+    pub next_cursor: Option<String>,
+    /// Whether there are more messages
+    pub has_more: Option<u32>,
+    /// Message list
+    pub msg_list: Option<Vec<KfMessage>>,
+}
+
+/// KF message from sync_msg API
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfMessage {
+    /// Message ID
+    pub msgid: String,
+    /// Customer service account ID (OpenKfId) - not present for event type
+    #[serde(default)]
+    pub open_kfid: Option<String>,
+    /// External user ID (customer) - not present for event type
+    #[serde(default)]
+    pub external_userid: Option<String>,
+    /// Message send time (unix timestamp)
+    pub send_time: u64,
+    /// Message origin: 3=customer reply, 4=system push, 5=servicer reply
+    #[serde(default)]
+    pub origin: Option<u32>,
+    /// Servicer userid (only when origin=5)
+    #[serde(default)]
+    pub servicer_userid: Option<String>,
+    /// Message type (string: "text", "image", "event", etc.)
+    pub msgtype: String,
+    /// Text content (if msgtype == "text")
+    #[serde(default)]
+    pub text: Option<KfTextContent>,
+    /// Image content (if msgtype == "image")
+    #[serde(default)]
+    pub image: Option<KfMediaContent>,
+    /// Voice content (if msgtype == "voice")
+    #[serde(default)]
+    pub voice: Option<KfMediaContent>,
+    /// Video content (if msgtype == "video")
+    #[serde(default)]
+    pub video: Option<KfMediaContent>,
+    /// File content (if msgtype == "file")
+    #[serde(default)]
+    pub file: Option<KfMediaContent>,
+    /// Location content (if msgtype == "location")
+    #[serde(default)]
+    pub location: Option<KfLocationContent>,
+    /// Link content (if msgtype == "link")
+    #[serde(default)]
+    pub link: Option<KfLinkContent>,
+    /// Event content (if msgtype == "event")
+    #[serde(default)]
+    pub event: Option<KfEventContent>,
+}
+
+/// Text message content
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfTextContent {
+    pub content: String,
+    #[serde(default)]
+    pub menu_id: Option<String>,
+}
+
+/// Media message content (image, voice, video, file)
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfMediaContent {
+    pub media_id: String,
+}
+
+/// Location message content
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfLocationContent {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub name: String,
+    pub address: String,
+}
+
+/// Link message content
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfLinkContent {
+    pub title: String,
+    pub desc: String,
+    pub url: String,
+    #[serde(default)]
+    pub pic_url: Option<String>,
+}
+
+/// Event message content
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct KfEventContent {
+    pub event_type: String,
+    pub open_kfid: String,
+    pub external_userid: String,
+    #[serde(default)]
+    pub scene: Option<String>,
+    #[serde(default)]
+    pub fail_msgid: Option<String>,
+    #[serde(default)]
+    pub fail_type: Option<u32>,
+}
+
 /// WeCom API client for sending async messages
 pub struct WecomApiClient {
     corp_id: String,
@@ -168,6 +297,115 @@ impl WecomApiClient {
                 Err(anyhow!("WeCom API error {}: {}", code, response.errmsg))
             }
         }
+    }
+
+    /// Sync KF (Customer Service) messages using token from kf_msg_or_event callback
+    ///
+    /// When WeCom sends kf_msg_or_event callback, it only contains a Token.
+    /// You must call this API to fetch the actual message content and external_userid.
+    /// The token is valid for 10 minutes.
+    pub async fn sync_kf_messages(&self, token: &str, open_kfid: &str) -> Result<KfSyncMsgResponse> {
+        let access_token = self.get_access_token().await?;
+
+        let url = format!(
+            "{}/kf/sync_msg?access_token={}",
+            WECOM_API_BASE, access_token
+        );
+
+        let body = KfSyncMsgRequest {
+            token: token.to_string(),
+            open_kfid: open_kfid.to_string(),
+            cursor: None,
+            limit: Some(100),
+        };
+
+        debug!(
+            "Syncing KF messages with token: {}..., open_kfid: {}",
+            &token[..20.min(token.len())],
+            open_kfid
+        );
+
+        let response = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .json::<KfSyncMsgResponse>()
+            .await?;
+
+        if response.errcode != 0 {
+            warn!(
+                "Failed to sync KF messages: {} - {}",
+                response.errcode, response.errmsg
+            );
+            return Err(anyhow!(
+                "KF sync_msg API error {}: {}",
+                response.errcode,
+                response.errmsg
+            ));
+        }
+
+        let msg_count = response.msg_list.as_ref().map(|l| l.len()).unwrap_or(0);
+        info!("Synced {} KF messages", msg_count);
+
+        Ok(response)
+    }
+
+    /// Send KF (Customer Service) text message to a user
+    ///
+    /// API: POST /kf/send_msg?access_token=ACCESS_TOKEN
+    /// Docs: https://developer.work.weixin.qq.com/document/path/94677
+    pub async fn send_kf_text_message(
+        &self,
+        touser: &str,
+        open_kfid: &str,
+        content: &str,
+    ) -> Result<WecomApiResponse> {
+        let access_token = self.get_access_token().await?;
+
+        let url = format!(
+            "{}/kf/send_msg?access_token={}",
+            WECOM_API_BASE, access_token
+        );
+
+        let body = serde_json::json!({
+            "touser": touser,
+            "open_kfid": open_kfid,
+            "msgtype": "text",
+            "text": {
+                "content": content
+            }
+        });
+
+        debug!(
+            "Sending KF text message to user={}, open_kfid={}",
+            touser, open_kfid
+        );
+
+        let response = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .json::<WecomApiResponse>()
+            .await?;
+
+        if response.errcode != 0 {
+            warn!(
+                "Failed to send KF message: {} - {}",
+                response.errcode, response.errmsg
+            );
+            return Err(anyhow!(
+                "KF send_msg API error {}: {}",
+                response.errcode,
+                response.errmsg
+            ));
+        }
+
+        info!("Sent KF text message to {} successfully", touser);
+        Ok(response)
     }
 }
 

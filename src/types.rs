@@ -160,53 +160,59 @@ pub struct WecomMessage {
     #[serde(rename = "ToUserName")]
     pub to_user_name: String,
     /// UserID of the sender (internal employee) - optional for kf_msg_or_event
-    #[serde(rename = "FromUserName")]
+    #[serde(rename = "FromUserName", default)]
     pub from_user_name: Option<String>,
-    #[serde(rename = "CreateTime")]
-    pub create_time: i64,
-    #[serde(rename = "MsgType")]
-    pub msg_type: MsgType,
+    #[serde(rename = "CreateTime", default)]
+    pub create_time: Option<i64>,
+    #[serde(rename = "MsgType", default)]
+    pub msg_type: Option<String>,
     /// Application ID - key difference from WeChat OA!
-    #[serde(rename = "AgentID")]
+    #[serde(rename = "AgentID", default)]
     pub agent_id: Option<i64>,
-    #[serde(rename = "Content")]
+    #[serde(rename = "Content", default)]
     pub content: Option<String>,
-    #[serde(rename = "MsgId")]
+    #[serde(rename = "MsgId", default)]
     pub msg_id: Option<i64>,
-    #[serde(rename = "PicUrl")]
+    #[serde(rename = "PicUrl", default)]
     pub pic_url: Option<String>,
-    #[serde(rename = "MediaId")]
+    #[serde(rename = "MediaId", default)]
     pub media_id: Option<String>,
-    #[serde(rename = "Format")]
+    #[serde(rename = "Format", default)]
     pub format: Option<String>,
-    #[serde(rename = "Recognition")]
+    #[serde(rename = "Recognition", default)]
     pub recognition: Option<String>,
-    #[serde(rename = "ThumbMediaId")]
+    #[serde(rename = "ThumbMediaId", default)]
     pub thumb_media_id: Option<String>,
-    #[serde(rename = "Location_X")]
+    #[serde(rename = "Location_X", default)]
     pub location_x: Option<f64>,
-    #[serde(rename = "Location_Y")]
+    #[serde(rename = "Location_Y", default)]
     pub location_y: Option<f64>,
-    #[serde(rename = "Scale")]
+    #[serde(rename = "Scale", default)]
     pub scale: Option<u32>,
-    #[serde(rename = "Label")]
+    #[serde(rename = "Label", default)]
     pub label: Option<String>,
-    #[serde(rename = "Title")]
+    #[serde(rename = "Title", default)]
     pub title: Option<String>,
-    #[serde(rename = "Description")]
+    #[serde(rename = "Description", default)]
     pub description: Option<String>,
-    #[serde(rename = "Url")]
+    #[serde(rename = "Url", default)]
     pub url: Option<String>,
-    #[serde(rename = "Event")]
+    /// Event type (e.g., "kf_msg_or_event")
+    #[serde(rename = "Event", default)]
     pub event: Option<String>,
-    #[serde(rename = "EventKey")]
+    #[serde(rename = "EventKey", default)]
     pub event_key: Option<String>,
-    #[serde(rename = "Ticket")]
+    #[serde(rename = "Ticket", default)]
     pub ticket: Option<String>,
-    #[serde(rename = "Token")]
-    pub token: Option<String>,
-    #[serde(rename = "OpenKfId")]
+    /// Token from kf_msg_or_event callback (use to call sync_msg API)
+    #[serde(rename = "Token", default)]
+    pub kf_token: Option<String>,
+    /// OpenKfId from kf_msg_or_event callback
+    #[serde(rename = "OpenKfId", default)]
     pub open_kfid: Option<String>,
+    /// KF message ID (string format from sync_msg API)
+    #[serde(rename = "KfMsgId", default)]
+    pub kf_msg_id: Option<String>,
 }
 
 // =============================================================================
@@ -342,7 +348,7 @@ mod tests {
         let msg: WecomMessage = serde_xml_rs::from_str(xml).unwrap();
         assert_eq!(msg.to_user_name, "ww1234567890abcdef");
         assert_eq!(msg.from_user_name, Some("zhangsan".to_string()));
-        assert_eq!(msg.msg_type, MsgType::Text);
+        assert_eq!(msg.msg_type, Some("text".to_string()));
         assert_eq!(msg.content, Some("Hello".to_string()));
         assert_eq!(msg.agent_id, Some(1000002));
     }
@@ -384,8 +390,8 @@ mod tests {
         let wecom_msg = WecomMessage {
             to_user_name: "ww_corp".to_string(),
             from_user_name: Some("userid123".to_string()),
-            create_time: 1234567890,
-            msg_type: MsgType::Text,
+            create_time: Some(1234567890),
+            msg_type: Some("text".to_string()),
             agent_id: Some(1000002),
             content: Some("Test".to_string()),
             msg_id: Some(1),
@@ -404,7 +410,7 @@ mod tests {
             event: None,
             event_key: None,
             ticket: None,
-            token: None,
+            kf_token: None,
             open_kfid: None,
         };
 

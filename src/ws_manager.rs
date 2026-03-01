@@ -39,6 +39,18 @@ impl WebSocketManager {
     pub fn add_client(&self, client_id: String, addr: SocketAddr, tx: mpsc::Sender<WsMessage>) {
         self.clients.insert(client_id.clone(), (addr, tx));
         self.broker.set_default_client(client_id.clone());
+
+        // Detect channel-specific clients based on client_id
+        let client_lower = client_id.to_lowercase();
+        if client_lower.contains("wecom")
+            || client_lower.contains("wechat-work")
+            || client_lower.contains("wx-work")
+        {
+            self.broker.set_wecom_client(client_id.clone());
+        } else if client_lower.contains("wechat") {
+            self.broker.set_wechat_client(client_id.clone());
+        }
+
         info!("Client {} connected from {}", client_id, addr);
     }
 
