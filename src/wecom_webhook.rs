@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use crate::broker::MessageBroker;
 use crate::config::ProxyConfig;
 use crate::crypto::WechatCrypto;
+use crate::storage::MessageStore;
 use crate::types::{WecomEncryptedBody, WecomEncryptedParams, WecomMessage, WecomVerifyParams};
 
 /// WeCom webhook server state
@@ -27,10 +28,15 @@ pub struct WecomWebhookState {
     pub config: ProxyConfig,
     pub broker: Arc<MessageBroker>,
     pub crypto: Option<WechatCrypto>,
+    pub storage: Option<Arc<MessageStore>>,
 }
 
 /// Run the WeCom webhook HTTP server
-pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow::Result<()> {
+pub async fn run_server(
+    addr: SocketAddr,
+    broker: Arc<MessageBroker>,
+    storage: Option<Arc<MessageStore>>,
+) -> anyhow::Result<()> {
     let config = broker.config.clone();
 
     // Create crypto if WeCom encryption is configured
@@ -59,6 +65,7 @@ pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow:
         config,
         broker,
         crypto,
+        storage,
     };
 
     let app = Router::new()
@@ -231,24 +238,33 @@ async fn handle_message(
                     info!("Synced KF messages, has_more={:?}", sync_response.has_more);
                     if let Some(msg_list) = sync_response.msg_list {
                         info!("Processing {} KF messages", msg_list.len());
-                        
+
                         // Bug fix: Only process the LATEST message (last in list, or highest send_time)
                         // sync_msg returns messages from oldest to newest
                         let latest_msg = msg_list.into_iter().rev().find(|m| {
                             // Find the latest customer message (origin=3) with text content
                             m.msgtype == "text" && m.origin == Some(3) && m.text.is_some()
                         });
-                        
+
                         if let Some(kf_msg) = latest_msg {
                             info!(
                                 "Processing LATEST KF message: msgid={}, msgtype={}, external_user={:?}, send_time={}",
-                                kf_msg.msgid, kf_msg.msgtype, kf_msg.external_userid, kf_msg.send_time
+                                kf_msg.msgid,
+                                kf_msg.msgtype,
+                                kf_msg.external_userid,
+                                kf_msg.send_time
                             );
 
                             let text = kf_msg.text.as_ref().unwrap();
-                            let external_user = kf_msg.external_userid.clone().unwrap_or_else(|| "unknown".to_string());
-                            let msg_open_kfid = kf_msg.open_kfid.clone().unwrap_or_else(|| open_kfid.clone());
-                            
+                            let external_user = kf_msg
+                                .external_userid
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let msg_open_kfid = kf_msg
+                                .open_kfid
+                                .clone()
+                                .unwrap_or_else(|| open_kfid.clone());
+
                             // Build WecomMessage from KF message
                             let kf_message = WecomMessage {
                                 to_user_name: message.to_user_name.clone(),
@@ -282,6 +298,49 @@ async fn handle_message(
                                 "Forwarding KF text message from {}: {}",
                                 external_user, text.content
                             );
+
+                            // Save message to storage (for dedup and history)
+                            if let Some(storage) = &state.storage {
+                                use crate::storage::KfMessage as StoredKfMessage;
+                                let stored_msg = StoredKfMessage::new(
+                                    kf_msg.msgid.clone(),
+                                    msg_open_kfid.clone(),
+                                    external_user.clone(),
+                                    "text".to_string(),
+                                    Some(text.content.clone()),
+                                    Some(3), // origin=user
+                                    kf_msg.send_time as i64,
+                                );
+                                match storage.save_message(&stored_msg) {
+                                    Ok(true) => debug!("Saved KF message to storage"),
+                                    Ok(false) => {
+                                        info!(
+                                            "KF message {} already in storage, skipping duplicate",
+                                            kf_msg.msgid
+                                        );
+                                        // Skip processing duplicate, but still return success
+                                    }
+                                    Err(e) => warn!("Failed to save KF message: {}", e),
+                                }
+
+                                // Update sync cursor
+                                if let Some(cursor) = &sync_response.next_cursor
+                                    && let Err(e) =
+                                        storage.save_sync_cursor(&msg_open_kfid, Some(cursor), 1)
+                                {
+                                    warn!("Failed to save sync cursor: {}", e);
+                                }
+
+                                // Update conversation state
+                                if let Err(e) = storage.update_conversation(
+                                    &msg_open_kfid,
+                                    &external_user,
+                                    &kf_msg.msgid,
+                                    true,
+                                ) {
+                                    warn!("Failed to update conversation state: {}", e);
+                                }
+                            }
 
                             // Use fire-and-forget pattern for KF messages
                             // WeCom expects immediate "success" response, reply comes via KF API
