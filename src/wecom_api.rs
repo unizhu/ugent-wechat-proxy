@@ -105,7 +105,14 @@ pub struct KfTextContent {
 #[derive(Debug, Clone, Deserialize)]
 
 pub struct KfMediaContent {
+    /// Media ID for downloading
     pub media_id: String,
+    /// COS URL (direct download URL, may be present)
+    #[serde(default)]
+    pub cos_url: Option<String>,
+    /// File size in bytes
+    #[serde(default)]
+    pub file_size: Option<u64>,
 }
 
 /// WeCom API client for sending async messages
@@ -370,7 +377,13 @@ impl WecomApiClient {
 
         debug!("Downloading media: media_id={}", media_id);
 
-        let response = self.http.get(&url).send().await?;
+        // Add timeout for media download (30 seconds)
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.http.get(&url).send(),
+        )
+        .await
+        .map_err(|_| anyhow!("Media download timeout after 30s"))??;
 
         // Check if response is an error (JSON) or binary data
         let content_type = response
@@ -379,12 +392,14 @@ impl WecomApiClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
+        debug!("Media download response content-type: {}", content_type);
+
         if content_type.contains("application/json") {
             // Error response
             let error: WecomApiResponse = response.json().await?;
             warn!(
-                "Failed to download media: {} - {}",
-                error.errcode, error.errmsg
+                "Failed to download media {}: {} - {}",
+                media_id, error.errcode, error.errmsg
             );
             return Err(anyhow!(
                 "Media download error {}: {}",
@@ -393,8 +408,13 @@ impl WecomApiClient {
             ));
         }
 
-        // Binary response
-        let data = response.bytes().await?.to_vec();
+        // Binary response - read with timeout
+        let data = tokio::time::timeout(std::time::Duration::from_secs(60), response.bytes())
+            .await
+            .map_err(|_| anyhow!("Media read timeout after 60s"))?
+            .map_err(|e| anyhow!("Failed to read media bytes: {}", e))?
+            .to_vec();
+
         info!(
             "Downloaded media {} successfully, size={} bytes",
             media_id,

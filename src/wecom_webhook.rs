@@ -3,6 +3,7 @@
 //! Handles webhook callbacks from WeCom platform:
 //! - GET request: URL verification during setup
 //! - POST request: Receive messages from WeCom users
+#![allow(clippy::too_many_arguments)]
 
 use axum::{
     Router,
@@ -239,6 +240,22 @@ async fn handle_message(
                     if let Some(ref msg_list) = sync_response.msg_list {
                         info!("Processing {} KF messages", msg_list.len());
 
+                        // Debug: log all messages with their types and origins
+                        for (idx, m) in msg_list.iter().enumerate() {
+                            debug!(
+                                "KF msg[{}]: msgid={}, msgtype={}, origin={:?}, external_user={:?}, send_time={}, has_text={}, has_image={}, has_voice={}",
+                                idx,
+                                m.msgid,
+                                m.msgtype,
+                                m.origin,
+                                m.external_userid,
+                                m.send_time,
+                                m.text.is_some(),
+                                m.image.is_some(),
+                                m.voice.is_some()
+                            );
+                        }
+
                         // Bug fix: Only process the LATEST message (last in list, or highest send_time)
                         // sync_msg returns messages from oldest to newest
                         let latest_msg = msg_list.iter().rev().find(|m| {
@@ -286,18 +303,39 @@ async fn handle_message(
                                 }
                                 "image" => {
                                     let image = kf_msg.image.as_ref().unwrap();
-                                    process_kf_image_message(
-                                        &state,
-                                        &message,
-                                        kf_msg,
-                                        &body,
-                                        &external_user,
-                                        &msg_open_kfid,
-                                        token,
-                                        &image.media_id,
-                                        &sync_response,
-                                    )
-                                    .await;
+                                    info!(
+                                        "Processing image message: media_id={:?}, cos_url={:?}, file_size={:?}",
+                                        image.media_id, image.cos_url, image.file_size
+                                    );
+
+                                    // Clone necessary data for background processing
+                                    let state_clone = state.clone();
+                                    let message_clone = message.clone();
+                                    let kf_msg_clone = kf_msg.clone();
+                                    let body_clone = body.to_string();
+                                    let external_user_clone = external_user.to_string();
+                                    let msg_open_kfid_clone = msg_open_kfid.to_string();
+                                    let token_clone = token.to_string();
+                                    let media_id_clone = image.media_id.clone();
+
+                                    // Spawn background task to download and process image
+                                    tokio::spawn(async move {
+                                        process_kf_image_message_spawned(
+                                            &state_clone,
+                                            &message_clone,
+                                            &kf_msg_clone,
+                                            &body_clone,
+                                            &external_user_clone,
+                                            &msg_open_kfid_clone,
+                                            &token_clone,
+                                            &media_id_clone,
+                                        )
+                                        .await;
+                                    });
+                                    info!(
+                                        "Spawned background task for image download: media_id={}",
+                                        image.media_id
+                                    );
                                 }
                                 "voice" => {
                                     let voice = kf_msg.voice.as_ref().unwrap();
@@ -319,6 +357,10 @@ async fn handle_message(
                                 }
                             }
                             return Ok("success".to_string());
+                        } else {
+                            warn!(
+                                "No matching KF message found (origin=3 with text/image/voice content)"
+                            );
                         }
                     }
                 }
@@ -432,8 +474,9 @@ async fn process_kf_text_message(
     forward_kf_message_to_broker(&state.broker, kf_message, body.to_string());
 }
 
-/// Process KF image message
-async fn process_kf_image_message(
+/// Process KF image message in background (spawned task)
+/// This allows the webhook to return success immediately while downloading the image
+async fn process_kf_image_message_spawned(
     state: &WecomWebhookState,
     original_message: &WecomMessage,
     kf_msg: &KfMessage,
@@ -442,16 +485,28 @@ async fn process_kf_image_message(
     msg_open_kfid: &str,
     token: &str,
     media_id: &str,
-    sync_response: &crate::wecom_api::KfSyncMsgResponse,
 ) {
-    // Download image from WeCom
-    let image_data = match download_media(state, media_id).await {
-        Some(data) => data,
-        None => {
+    info!("Background processing image message: media_id={}", media_id);
+
+    // Download image from WeCom with timeout
+    let image_data = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        download_media(state, media_id),
+    )
+    .await
+    {
+        Ok(Some(data)) => data,
+        Ok(None) => {
             warn!("Failed to download image media_id={}", media_id);
             return;
         }
+        Err(_) => {
+            warn!("Timeout downloading image media_id={}", media_id);
+            return;
+        }
     };
+
+    info!("Downloaded image {} ({} bytes)", media_id, image_data.len());
 
     // Save to cache and get local path
     let cache = MediaCache::new(&state.config.media_cache_dir);
@@ -500,17 +555,6 @@ async fn process_kf_image_message(
         external_user, media_id, local_path
     );
 
-    // Save message to storage
-    save_kf_message_to_storage(
-        state,
-        kf_msg,
-        msg_open_kfid,
-        external_user,
-        "image",
-        None,
-        sync_response,
-    );
-
     // Forward to broker with media content
     let media_content = MediaContent::Image {
         media_id: media_id.to_string(),
@@ -518,6 +562,7 @@ async fn process_kf_image_message(
         data: Some(base64_data),
     };
     forward_kf_media_message_to_broker(&state.broker, kf_message, body.to_string(), media_content);
+    info!("Image message processing completed: media_id={}", media_id);
 }
 
 /// Process KF voice message
