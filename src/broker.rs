@@ -14,12 +14,11 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::ProxyConfig;
-use crate::types::{Channel, ProxyMessage, WechatMessage, WecomMessage};
+use crate::types::{Channel, MediaContent, ProxyMessage, WechatMessage, WecomMessage};
 use crate::wechat_api::{TemplateMessageData, WechatApiClient};
 use crate::wecom_api::WecomApiClient;
 
 /// Pending response tracker
-#[allow(dead_code)]
 struct PendingResponse {
     /// Response channel
     tx: oneshot::Sender<String>,
@@ -35,7 +34,6 @@ struct PendingResponse {
     created_at: std::time::Instant,
     /// KF (Customer Service) fields - only set for KF messages
     kf_open_kfid: Option<String>,
-    kf_token: Option<String>,
 }
 
 /// Message broker state
@@ -136,7 +134,6 @@ impl MessageBroker {
                 channel: Channel::Wechat,
                 created_at: std::time::Instant::now(),
                 kf_open_kfid: None,
-                kf_token: None,
             },
         );
 
@@ -189,7 +186,6 @@ impl MessageBroker {
 
         // Store KF fields for async reply
         let kf_open_kfid = message.open_kfid.clone();
-        let kf_token = message.kf_token.clone();
         let is_kf_message = kf_open_kfid.is_some();
 
         self.pending.insert(
@@ -202,7 +198,6 @@ impl MessageBroker {
                 channel: Channel::Wecom,
                 created_at: std::time::Instant::now(),
                 kf_open_kfid: kf_open_kfid.clone(),
-                kf_token: kf_token.clone(),
             },
         );
 
@@ -244,6 +239,62 @@ impl MessageBroker {
                 Err(anyhow!("Timeout waiting for response"))
             }
         }
+    }
+
+    /// Forward media message from WeCom (Enterprise WeChat) to UGENT
+    pub async fn forward_wecom_media_message(
+        &self,
+        message: WecomMessage,
+        raw_xml: String,
+        media_content: MediaContent,
+    ) -> Result<String> {
+        let client_id = self.get_target_client_for_channel(Channel::Wecom)?;
+        let mut proxy_msg = ProxyMessage::wecom_inbound(&client_id, message.clone(), raw_xml);
+
+        // Set media_content on the message
+        proxy_msg.media_content = Some(media_content.clone());
+
+        let (tx, _rx) = oneshot::channel();
+        let user_id = message
+            .from_user_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let to_user = message.to_user_name.clone();
+        let agent_id = message.agent_id;
+        let kf_open_kfid = message.open_kfid.clone();
+
+        self.pending.insert(
+            proxy_msg.id,
+            PendingResponse {
+                tx,
+                original_from_user: user_id,
+                original_to_user: to_user,
+                original_agent_id: agent_id,
+                channel: Channel::Wecom,
+                created_at: std::time::Instant::now(),
+                kf_open_kfid,
+            },
+        );
+
+        self.cleanup_old_pending();
+
+        debug!(
+            "Forwarding WeCom media message {} to client {} (type: {:?})",
+            proxy_msg.id, client_id, media_content
+        );
+
+        if let Err(e) = self.message_tx.send(proxy_msg.clone()) {
+            warn!(
+                "Failed to broadcast media message to WebSocket clients: {}",
+                e
+            );
+            self.pending.remove(&proxy_msg.id);
+            return Err(anyhow!("No connected WebSocket clients"));
+        }
+
+        // For media messages, return immediately (response will be sent via API)
+        debug!("Media message forwarded, response will be sent via KF API");
+        Ok("success".to_string())
     }
 
     /// Handle response from UGENT client (routes to correct channel)

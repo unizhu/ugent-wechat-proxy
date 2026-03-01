@@ -6,7 +6,6 @@
 //! - Customer service message sending (within 48h window)
 
 // These will be used in Phase 2 when integrated with broker
-#![allow(dead_code)]
 
 use anyhow::{Context, Result, anyhow};
 use parking_lot::RwLock;
@@ -21,7 +20,6 @@ use tracing::{debug, error, info, warn};
 // API Endpoints
 // =============================================================================
 
-const WECHAT_API_BASE: &str = "https://api.weixin.qq.com/cgi-bin";
 const TOKEN_URL: &str = "https://api.weixin.qq.com/cgi-bin/token";
 const TEMPLATE_SEND_URL: &str = "https://api.weixin.qq.com/cgi-bin/message/template/send";
 const CUSTOM_SEND_URL: &str = "https://api.weixin.qq.com/cgi-bin/message/custom/send";
@@ -62,13 +60,6 @@ struct TokenResponse {
     errcode: Option<i32>,
     #[serde(default)]
     errmsg: Option<String>,
-}
-
-/// Generic WeChat API error response
-#[derive(Debug, Deserialize)]
-struct WechatErrorResponse {
-    errcode: i32,
-    errmsg: String,
 }
 
 // =============================================================================

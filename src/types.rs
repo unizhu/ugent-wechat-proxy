@@ -139,13 +139,7 @@ pub struct WecomEncryptedParams {
 /// WeCom encrypted message body
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename = "xml")]
-#[allow(dead_code)]
 pub struct WecomEncryptedBody {
-    #[serde(rename = "ToUserName")]
-    pub to_user_name: String,
-    /// AgentID may be empty CDATA, so use String and parse later
-    #[serde(rename = "AgentID", default)]
-    pub agent_id: Option<String>,
     #[serde(rename = "Encrypt")]
     pub encrypt: String,
 }
@@ -229,6 +223,39 @@ pub enum Direction {
     Outbound,
 }
 
+/// Media content type for multimedia messages
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum MediaContent {
+    /// Text message
+    Text { content: String },
+    /// Image message
+    Image {
+        /// WeCom media ID
+        media_id: String,
+        /// Local file path after download
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
+        /// Base64 encoded data
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
+    /// Voice message
+    Voice {
+        /// WeCom media ID
+        media_id: String,
+        /// Local file path after download
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
+        /// Base64 encoded data
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+        /// Voice format (usually "amr" for WeCom)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+    },
+}
+
 /// Proxy message wrapper - unified message format for both channels
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyMessage {
@@ -251,6 +278,9 @@ pub struct ProxyMessage {
     /// Raw XML (for passthrough)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_xml: Option<String>,
+    /// Media content (image, voice, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_content: Option<MediaContent>,
     /// Response content (for outbound)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
@@ -271,6 +301,7 @@ impl ProxyMessage {
             wechat_message: Some(message),
             wecom_message: None,
             raw_xml: Some(raw_xml),
+            media_content: None,
             response: None,
             error: None,
         }
@@ -287,6 +318,7 @@ impl ProxyMessage {
             wechat_message: None,
             wecom_message: Some(message),
             raw_xml: Some(raw_xml),
+            media_content: None,
             response: None,
             error: None,
         }
