@@ -88,6 +88,21 @@ pub struct ProxyConfig {
     /// Rate limit: max messages per minute per client
     #[serde(default = "default_rate_limit")]
     pub rate_limit: u32,
+
+    // =========================================================================
+    // Storage Configuration
+    // =========================================================================
+    /// Enable message storage
+    #[serde(default)]
+    pub storage_enabled: bool,
+
+    /// Storage database path
+    #[serde(default = "default_storage_path")]
+    pub storage_path: String,
+
+    /// Message retention days (0 = keep forever)
+    #[serde(default = "default_retention_days")]
+    pub message_retention_days: i64,
 }
 
 fn default_webhook_addr() -> String {
@@ -112,6 +127,15 @@ fn default_max_connections() -> usize {
 
 fn default_rate_limit() -> u32 {
     100
+}
+
+fn default_storage_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{}/.ugent/database/wecom_cache.db", home)
+}
+
+fn default_retention_days() -> i64 {
+    30
 }
 
 impl ProxyConfig {
@@ -166,6 +190,14 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100),
+
+            // Storage config
+            storage_enabled: std::env::var("STORAGE_ENABLED").is_ok(),
+            storage_path: std::env::var("STORAGE_PATH").unwrap_or_else(|_| default_storage_path()),
+            message_retention_days: std::env::var("MESSAGE_RETENTION_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
         })
     }
 

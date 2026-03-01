@@ -412,6 +412,7 @@ mod tests {
             ticket: None,
             kf_token: None,
             open_kfid: None,
+            kf_msg_id: None,
         };
 
         let proxy = ProxyMessage::wecom_inbound("client1", wecom_msg, "<xml/>".to_string());

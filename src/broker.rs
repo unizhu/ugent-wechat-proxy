@@ -186,7 +186,7 @@ impl MessageBroker {
             .unwrap_or_else(|| "unknown".to_string());
         let to_user = message.to_user_name.clone();
         let agent_id = message.agent_id;
-        
+
         // Store KF fields for async reply
         let kf_open_kfid = message.open_kfid.clone();
         let kf_token = message.kf_token.clone();
@@ -207,7 +207,7 @@ impl MessageBroker {
         );
 
         self.cleanup_old_pending();
-        
+
         debug!(
             "Forwarding WeCom message {} to client {} (KF: {}, open_kfid: {:?})",
             proxy_msg.id, client_id, is_kf_message, kf_open_kfid
@@ -225,7 +225,7 @@ impl MessageBroker {
             debug!("KF message forwarded, response will be sent via KF API");
             return Ok("success".to_string());
         }
-        
+
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(response)) => {
                 info!("Got response for WeCom message {}", proxy_msg.id);
@@ -236,7 +236,8 @@ impl MessageBroker {
                 self.pending.remove(&proxy_msg.id);
                 // For KF messages, use KF API for async reply
                 if is_kf_message {
-                    self.try_kf_async_reply(&user_id, &kf_open_kfid.unwrap()).await;
+                    self.try_kf_async_reply(&user_id, &kf_open_kfid.unwrap())
+                        .await;
                 } else {
                     self.try_wecom_async_reply(&user_id).await;
                 }
@@ -268,7 +269,10 @@ impl MessageBroker {
                     .await
                 {
                     Ok(resp) if resp.errcode == 0 => {
-                        info!("KF reply sent successfully to {}", pending.original_from_user);
+                        info!(
+                            "KF reply sent successfully to {}",
+                            pending.original_from_user
+                        );
                     }
                     Ok(resp) => {
                         warn!(
@@ -407,7 +411,10 @@ impl MessageBroker {
             );
 
             let message = "您的消息已收到，正在处理中，请稍候...";
-            match api.send_kf_text_message(external_user, open_kfid, message).await {
+            match api
+                .send_kf_text_message(external_user, open_kfid, message)
+                .await
+            {
                 Ok(result) if result.errcode == 0 => {
                     info!("KF async reply sent successfully to {}", external_user);
                 }

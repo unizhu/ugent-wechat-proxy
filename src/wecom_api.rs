@@ -304,7 +304,11 @@ impl WecomApiClient {
     /// When WeCom sends kf_msg_or_event callback, it only contains a Token.
     /// You must call this API to fetch the actual message content and external_userid.
     /// The token is valid for 10 minutes.
-    pub async fn sync_kf_messages(&self, token: &str, open_kfid: &str) -> Result<KfSyncMsgResponse> {
+    pub async fn sync_kf_messages(
+        &self,
+        token: &str,
+        open_kfid: &str,
+    ) -> Result<KfSyncMsgResponse> {
         let access_token = self.get_access_token().await?;
 
         let url = format!(

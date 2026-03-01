@@ -25,6 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod broker;
 mod config;
 mod crypto;
+mod storage;
 mod types;
 mod webhook;
 mod wechat_api;
@@ -34,6 +35,7 @@ mod ws_manager;
 
 use broker::MessageBroker;
 use config::ProxyConfig;
+use storage::MessageStore;
 use ws_manager::WebSocketManager;
 
 #[tokio::main]
@@ -52,6 +54,29 @@ async fn main() -> Result<()> {
     let config = ProxyConfig::from_env()?;
     info!("📋 Configuration loaded");
 
+    // Initialize storage if enabled
+    let storage = if config.storage_enabled {
+        match MessageStore::new(&config.storage_path) {
+            Ok(store) => {
+                info!("📦 Storage initialized at {:?}", store.path());
+                if let Ok(stats) = store.get_stats() {
+                    info!(
+                        "📊 Storage stats: {} messages, {} conversations, {} pending",
+                        stats.message_count, stats.conversation_count, stats.pending_count
+                    );
+                }
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize storage: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("📦 Storage disabled");
+        None
+    };
+
     // Create shared state
     let broker = Arc::new(MessageBroker::new(config.clone()));
     let ws_manager = Arc::new(WebSocketManager::new(broker.clone()));
@@ -63,7 +88,11 @@ async fn main() -> Result<()> {
     // Spawn WeCom webhook server if enabled
     let wecom_server = if config.wecom_enabled {
         let wecom_addr: SocketAddr = config.wecom_webhook_addr.parse()?;
-        Some(spawn_wecom_server(wecom_addr, broker.clone()))
+        Some(spawn_wecom_server(
+            wecom_addr,
+            broker.clone(),
+            storage.clone(),
+        ))
     } else {
         info!("⏭️ WeCom webhook server disabled");
         None
@@ -128,9 +157,13 @@ fn spawn_websocket_server(
 }
 
 /// Spawn the WeCom webhook HTTP server
-fn spawn_wecom_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> tokio::task::JoinHandle<()> {
+fn spawn_wecom_server(
+    addr: SocketAddr,
+    broker: Arc<MessageBroker>,
+    storage: Option<Arc<MessageStore>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = wecom_webhook::run_server(addr, broker).await {
+        if let Err(e) = wecom_webhook::run_server(addr, broker, storage).await {
             tracing::error!("WeCom webhook server error: {}", e);
         }
     })
