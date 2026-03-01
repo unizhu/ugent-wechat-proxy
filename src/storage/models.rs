@@ -51,73 +51,6 @@ impl KfMessage {
     }
 }
 
-/// Sync state for cursor-based message recovery
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KfSyncState {
-    /// Customer service account ID
-    pub open_kfid: String,
-    /// Next cursor for sync_msg API
-    pub cursor: Option<String>,
-    /// Last successful sync time
-    pub last_sync_time: DateTime<Utc>,
-    /// Total messages synced
-    pub message_count: i64,
-}
-
-impl KfSyncState {
-    /// Create a new sync state
-    #[allow(dead_code)]
-    pub fn new(open_kfid: String) -> Self {
-        Self {
-            open_kfid,
-            cursor: None,
-            last_sync_time: Utc::now(),
-            message_count: 0,
-        }
-    }
-}
-
-/// Conversation state tracking
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KfConversation {
-    /// Unique database ID
-    pub id: i64,
-    /// Customer service account ID
-    pub open_kfid: String,
-    /// External user ID
-    pub external_userid: String,
-    /// Last message ID in this conversation
-    pub last_msgid: Option<String>,
-    /// When the last message was received
-    pub last_message_at: Option<DateTime<Utc>>,
-    /// Whether waiting for LLM response
-    pub pending_response: bool,
-    /// When this conversation was created
-    pub created_at: DateTime<Utc>,
-    /// When this conversation was last updated
-    pub updated_at: DateTime<Utc>,
-}
-
-impl KfConversation {
-    /// Create a new conversation
-    #[allow(dead_code)]
-    pub fn new(open_kfid: String, external_userid: String) -> Self {
-        let now = Utc::now();
-        Self {
-            id: 0,
-            open_kfid,
-            external_userid,
-            last_msgid: None,
-            last_message_at: None,
-            pending_response: false,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,24 +70,5 @@ mod tests {
         assert_eq!(msg.msgid, "msg123");
         assert_eq!(msg.msgtype, "text");
         assert_eq!(msg.origin, Some(3));
-    }
-
-    #[test]
-    fn test_kf_sync_state_creation() {
-        let state = KfSyncState::new("wk6RwaQgAA9TgoDd65jDDalYq5FZkT6w".to_string());
-        assert_eq!(state.open_kfid, "wk6RwaQgAA9TgoDd65jDDalYq5FZkT6w");
-        assert_eq!(state.cursor, None);
-        assert_eq!(state.message_count, 0);
-    }
-
-    #[test]
-    fn test_kf_conversation_creation() {
-        let conv = KfConversation::new(
-            "wk6RwaQgAA9TgoDd65jDDalYq5FZkT6w".to_string(),
-            "wm6RwaQgAA4oyMBrwj3xAn5xt1fxa6ww".to_string(),
-        );
-
-        assert_eq!(conv.open_kfid, "wk6RwaQgAA9TgoDd65jDDalYq5FZkT6w");
-        assert!(!conv.pending_response);
     }
 }

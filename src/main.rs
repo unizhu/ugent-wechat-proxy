@@ -25,6 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod broker;
 mod config;
 mod crypto;
+mod media_cache;
 mod storage;
 mod types;
 mod webhook;
@@ -58,13 +59,7 @@ async fn main() -> Result<()> {
     let storage = if config.storage_enabled {
         match MessageStore::new(&config.storage_path) {
             Ok(store) => {
-                info!("📦 Storage initialized at {:?}", store.path());
-                if let Ok(stats) = store.get_stats() {
-                    info!(
-                        "📊 Storage stats: {} messages, {} conversations, {} pending",
-                        stats.message_count, stats.conversation_count, stats.pending_count
-                    );
-                }
+                info!("📦 Storage initialized at {:?}", config.storage_path);
                 Some(Arc::new(store))
             }
             Err(e) => {

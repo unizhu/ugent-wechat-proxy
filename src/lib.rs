@@ -45,6 +45,7 @@
 pub mod broker;
 pub mod config;
 pub mod crypto;
+pub mod media_cache;
 pub mod storage;
 pub mod types;
 pub mod webhook;
@@ -56,7 +57,8 @@ pub mod ws_manager;
 pub use broker::MessageBroker;
 pub use config::ProxyConfig;
 pub use crypto::WechatCrypto;
-pub use storage::{KfConversation, KfMessage, KfSyncState, MessageStore};
+pub use media_cache::MediaCache;
+pub use storage::{KfMessage, MessageStore};
 pub use types::*;
 pub use wechat_api::WechatApiClient;
 pub use wecom_api::WecomApiClient;

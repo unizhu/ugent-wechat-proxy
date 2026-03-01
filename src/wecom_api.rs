@@ -52,7 +52,7 @@ struct KfSyncMsgRequest {
 
 /// KF sync_msg response
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
+
 pub struct KfSyncMsgResponse {
     pub errcode: i64,
     pub errmsg: String,
@@ -66,7 +66,7 @@ pub struct KfSyncMsgResponse {
 
 /// KF message from sync_msg API
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
+
 pub struct KfMessage {
     /// Message ID
     pub msgid: String,
@@ -81,9 +81,6 @@ pub struct KfMessage {
     /// Message origin: 3=customer reply, 4=system push, 5=servicer reply
     #[serde(default)]
     pub origin: Option<u32>,
-    /// Servicer userid (only when origin=5)
-    #[serde(default)]
-    pub servicer_userid: Option<String>,
     /// Message type (string: "text", "image", "event", etc.)
     pub msgtype: String,
     /// Text content (if msgtype == "text")
@@ -95,73 +92,20 @@ pub struct KfMessage {
     /// Voice content (if msgtype == "voice")
     #[serde(default)]
     pub voice: Option<KfMediaContent>,
-    /// Video content (if msgtype == "video")
-    #[serde(default)]
-    pub video: Option<KfMediaContent>,
-    /// File content (if msgtype == "file")
-    #[serde(default)]
-    pub file: Option<KfMediaContent>,
-    /// Location content (if msgtype == "location")
-    #[serde(default)]
-    pub location: Option<KfLocationContent>,
-    /// Link content (if msgtype == "link")
-    #[serde(default)]
-    pub link: Option<KfLinkContent>,
-    /// Event content (if msgtype == "event")
-    #[serde(default)]
-    pub event: Option<KfEventContent>,
 }
 
 /// Text message content
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
+
 pub struct KfTextContent {
     pub content: String,
-    #[serde(default)]
-    pub menu_id: Option<String>,
 }
 
-/// Media message content (image, voice, video, file)
+/// Media message content (image, voice)
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
+
 pub struct KfMediaContent {
     pub media_id: String,
-}
-
-/// Location message content
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct KfLocationContent {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub name: String,
-    pub address: String,
-}
-
-/// Link message content
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct KfLinkContent {
-    pub title: String,
-    pub desc: String,
-    pub url: String,
-    #[serde(default)]
-    pub pic_url: Option<String>,
-}
-
-/// Event message content
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct KfEventContent {
-    pub event_type: String,
-    pub open_kfid: String,
-    pub external_userid: String,
-    #[serde(default)]
-    pub scene: Option<String>,
-    #[serde(default)]
-    pub fail_msgid: Option<String>,
-    #[serde(default)]
-    pub fail_type: Option<u32>,
 }
 
 /// WeCom API client for sending async messages
@@ -410,6 +354,53 @@ impl WecomApiClient {
 
         info!("Sent KF text message to {} successfully", touser);
         Ok(response)
+    }
+
+    /// Download media file from WeCom
+    ///
+    /// API: GET /media/get?access_token=ACCESS_TOKEN&media_id=MEDIA_ID
+    /// Returns: binary content of the media file
+    pub async fn get_media(&self, media_id: &str) -> Result<Vec<u8>> {
+        let access_token = self.get_access_token().await?;
+
+        let url = format!(
+            "{}/media/get?access_token={}&media_id={}",
+            WECOM_API_BASE, access_token, media_id
+        );
+
+        debug!("Downloading media: media_id={}", media_id);
+
+        let response = self.http.get(&url).send().await?;
+
+        // Check if response is an error (JSON) or binary data
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if content_type.contains("application/json") {
+            // Error response
+            let error: WecomApiResponse = response.json().await?;
+            warn!(
+                "Failed to download media: {} - {}",
+                error.errcode, error.errmsg
+            );
+            return Err(anyhow!(
+                "Media download error {}: {}",
+                error.errcode,
+                error.errmsg
+            ));
+        }
+
+        // Binary response
+        let data = response.bytes().await?.to_vec();
+        info!(
+            "Downloaded media {} successfully, size={} bytes",
+            media_id,
+            data.len()
+        );
+        Ok(data)
     }
 }
 

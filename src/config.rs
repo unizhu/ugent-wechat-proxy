@@ -103,6 +103,13 @@ pub struct ProxyConfig {
     /// Message retention days (0 = keep forever)
     #[serde(default = "default_retention_days")]
     pub message_retention_days: i64,
+
+    // =========================================================================
+    // Media Cache Configuration
+    // =========================================================================
+    /// Media cache directory (for downloaded images, voice files)
+    #[serde(default = "default_media_cache_dir")]
+    pub media_cache_dir: String,
 }
 
 fn default_webhook_addr() -> String {
@@ -136,6 +143,10 @@ fn default_storage_path() -> String {
 
 fn default_retention_days() -> i64 {
     30
+}
+
+fn default_media_cache_dir() -> String {
+    "/tmp/ugent-media-cache".to_string()
 }
 
 impl ProxyConfig {
@@ -198,6 +209,10 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30),
+
+            // Media cache config
+            media_cache_dir: std::env::var("MEDIA_CACHE_DIR")
+                .unwrap_or_else(|_| default_media_cache_dir()),
         })
     }
 
