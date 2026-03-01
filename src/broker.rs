@@ -19,6 +19,7 @@ use crate::wechat_api::{TemplateMessageData, WechatApiClient};
 use crate::wecom_api::WecomApiClient;
 
 /// Pending response tracker
+#[allow(dead_code)]
 struct PendingResponse {
     /// Response channel
     tx: oneshot::Sender<String>,
@@ -32,6 +33,9 @@ struct PendingResponse {
     channel: Channel,
     /// When this pending response was created
     created_at: std::time::Instant,
+    /// KF (Customer Service) fields - only set for KF messages
+    kf_open_kfid: Option<String>,
+    kf_token: Option<String>,
 }
 
 /// Message broker state
@@ -39,14 +43,20 @@ pub struct MessageBroker {
     pub config: ProxyConfig,
     /// Pending responses: message_id -> response channel
     pending: Arc<DashMap<Uuid, PendingResponse>>,
-    /// Default client ID for routing (first connected client)
+    /// Default client ID for routing (fallback)
     default_client: Arc<parking_lot::RwLock<Option<String>>>,
+    /// WeChat-specific client ID (for routing WeChat messages)
+    wechat_client: Arc<parking_lot::RwLock<Option<String>>>,
+    /// WeCom-specific client ID (for routing WeCom messages)
+    wecom_client: Arc<parking_lot::RwLock<Option<String>>>,
     /// Broadcast channel for sending messages to WebSocket clients
     message_tx: broadcast::Sender<ProxyMessage>,
     /// WeChat API client (for async replies via Customer Service API)
     wechat_api: Option<Arc<WechatApiClient>>,
     /// WeCom API client (for async replies via Application Message API)
     wecom_api: Option<Arc<WecomApiClient>>,
+    /// KF (Customer Service) API client for sync_msg (uses KF secret, not corp secret)
+    pub kf_api: Option<Arc<WecomApiClient>>,
 }
 
 impl MessageBroker {
@@ -75,13 +85,30 @@ impl MessageBroker {
                 ))
             });
 
+        // Create KF (Customer Service) API client if KF secret is available
+        // KF uses a separate secret from corp secret
+        let kf_api = config
+            .wecom_corp_id
+            .as_ref()
+            .zip(config.wecom_kf_secret.as_ref())
+            .map(|(corp_id, kf_secret)| {
+                Arc::new(WecomApiClient::new(
+                    corp_id.clone(),
+                    kf_secret.clone(),
+                    0, // KF doesn't use agent_id
+                ))
+            });
+
         Self {
             config,
             pending: Arc::new(DashMap::new()),
             default_client: Arc::new(parking_lot::RwLock::new(None)),
+            wechat_client: Arc::new(parking_lot::RwLock::new(None)),
+            wecom_client: Arc::new(parking_lot::RwLock::new(None)),
             message_tx,
             wechat_api,
             wecom_api,
+            kf_api,
         }
     }
 
@@ -92,7 +119,7 @@ impl MessageBroker {
 
     /// Forward message from WeChat Official Account to UGENT
     pub async fn forward_message(&self, message: WechatMessage, raw_xml: String) -> Result<String> {
-        let client_id = self.get_target_client()?;
+        let client_id = self.get_target_client_for_channel(Channel::Wechat)?;
         let proxy_msg = ProxyMessage::wechat_inbound(&client_id, message.clone(), raw_xml);
 
         let (tx, rx) = oneshot::channel();
@@ -108,6 +135,8 @@ impl MessageBroker {
                 original_agent_id: None,
                 channel: Channel::Wechat,
                 created_at: std::time::Instant::now(),
+                kf_open_kfid: None,
+                kf_token: None,
             },
         );
 
@@ -145,18 +174,23 @@ impl MessageBroker {
         message: WecomMessage,
         raw_xml: String,
     ) -> Result<String> {
-        let client_id = self.get_target_client()?;
+        let client_id = self.get_target_client_for_channel(Channel::Wecom)?;
         let proxy_msg = ProxyMessage::wecom_inbound(&client_id, message.clone(), raw_xml);
 
         let (tx, rx) = oneshot::channel();
-        // Support regular messages and customer service messages
+        // For KF messages: from_user_name = external_userid, open_kfid = customer service account
+        // For regular WeCom messages: from_user_name = internal user id
         let user_id = message
             .from_user_name
             .clone()
-            .or_else(|| message.open_kfid.clone())
             .unwrap_or_else(|| "unknown".to_string());
         let to_user = message.to_user_name.clone();
         let agent_id = message.agent_id;
+        
+        // Store KF fields for async reply
+        let kf_open_kfid = message.open_kfid.clone();
+        let kf_token = message.kf_token.clone();
+        let is_kf_message = kf_open_kfid.is_some();
 
         self.pending.insert(
             proxy_msg.id,
@@ -167,14 +201,16 @@ impl MessageBroker {
                 original_agent_id: agent_id,
                 channel: Channel::Wecom,
                 created_at: std::time::Instant::now(),
+                kf_open_kfid: kf_open_kfid.clone(),
+                kf_token: kf_token.clone(),
             },
         );
 
         self.cleanup_old_pending();
-
+        
         debug!(
-            "Forwarding WeCom message {} to client {}",
-            proxy_msg.id, client_id
+            "Forwarding WeCom message {} to client {} (KF: {}, open_kfid: {:?})",
+            proxy_msg.id, client_id, is_kf_message, kf_open_kfid
         );
 
         if let Err(e) = self.message_tx.send(proxy_msg.clone()) {
@@ -184,6 +220,12 @@ impl MessageBroker {
         }
 
         let timeout_duration = Duration::from_secs(self.config.message_timeout_secs);
+        // For KF messages, don't wait for response - it will be sent via KF API asynchronously
+        if is_kf_message {
+            debug!("KF message forwarded, response will be sent via KF API");
+            return Ok("success".to_string());
+        }
+        
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(response)) => {
                 info!("Got response for WeCom message {}", proxy_msg.id);
@@ -192,7 +234,12 @@ impl MessageBroker {
             Ok(Err(_)) => Err(anyhow!("Response channel closed")),
             Err(_) => {
                 self.pending.remove(&proxy_msg.id);
-                self.try_wecom_async_reply(&user_id).await;
+                // For KF messages, use KF API for async reply
+                if is_kf_message {
+                    self.try_kf_async_reply(&user_id, &kf_open_kfid.unwrap()).await;
+                } else {
+                    self.try_wecom_async_reply(&user_id).await;
+                }
                 Err(anyhow!("Timeout waiting for response"))
             }
         }
@@ -208,7 +255,37 @@ impl MessageBroker {
         debug!("Received response for message {} from client", original_id);
 
         if let Some((_, pending)) = self.pending.remove(&original_id) {
-            // Build response based on channel
+            // Check if this is a KF (Customer Service) message
+            if let (Some(kf_open_kfid), Some(kf_api)) = (&pending.kf_open_kfid, &self.kf_api) {
+                // KF message - send via KF API, not XML response
+                info!(
+                    "Sending KF reply to user={}, open_kfid={}",
+                    pending.original_from_user, kf_open_kfid
+                );
+
+                match kf_api
+                    .send_kf_text_message(&pending.original_from_user, kf_open_kfid, &content)
+                    .await
+                {
+                    Ok(resp) if resp.errcode == 0 => {
+                        info!("KF reply sent successfully to {}", pending.original_from_user);
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            "Failed to send KF reply: {} - {}",
+                            resp.errcode, resp.errmsg
+                        );
+                    }
+                    Err(e) => {
+                        error!("Error sending KF reply: {}", e);
+                    }
+                }
+                // For KF messages, we don't need to send via oneshot channel
+                // The reply is already sent via API
+                return Ok(());
+            }
+
+            // Non-KF message - build XML response
             let response_xml = match pending.channel {
                 Channel::Wechat => build_wechat_response(
                     &pending.original_to_user,
@@ -321,6 +398,32 @@ impl MessageBroker {
         }
     }
 
+    /// Try async reply via WeCom KF (Customer Service) API
+    async fn try_kf_async_reply(&self, external_user: &str, open_kfid: &str) {
+        if let Some(ref api) = self.kf_api {
+            info!(
+                "Attempting async reply via KF API to user={}, open_kfid={}",
+                external_user, open_kfid
+            );
+
+            let message = "您的消息已收到，正在处理中，请稍候...";
+            match api.send_kf_text_message(external_user, open_kfid, message).await {
+                Ok(result) if result.errcode == 0 => {
+                    info!("KF async reply sent successfully to {}", external_user);
+                }
+                Ok(result) => {
+                    warn!(
+                        "Failed to send KF async reply: {} - {}",
+                        result.errcode, result.errmsg
+                    );
+                }
+                Err(e) => {
+                    error!("Error sending KF async reply: {}", e);
+                }
+            }
+        }
+    }
+
     /// Set default client (called when first client connects)
     pub fn set_default_client(&self, client_id: String) {
         let mut guard = self.default_client.write();
@@ -329,20 +432,69 @@ impl MessageBroker {
         }
     }
 
+    /// Set WeChat-specific client (called when client with "wechat" in ID connects)
+    pub fn set_wechat_client(&self, client_id: String) {
+        let mut guard = self.wechat_client.write();
+        *guard = Some(client_id.clone());
+        debug!("Set WeChat client to: {}", client_id);
+    }
+
+    /// Set WeCom-specific client (called when client with "wecom" in ID connects)
+    pub fn set_wecom_client(&self, client_id: String) {
+        let mut guard = self.wecom_client.write();
+        *guard = Some(client_id.clone());
+        debug!("Set WeCom client to: {}", client_id);
+    }
+
     /// Clear default client (called when client disconnects)
     pub fn clear_default_client(&self, client_id: &str) {
         let mut guard = self.default_client.write();
         if guard.as_ref() == Some(&client_id.to_string()) {
             *guard = None;
         }
+        // Also clear channel-specific clients
+        {
+            let mut wechat_guard = self.wechat_client.write();
+            if wechat_guard.as_ref() == Some(&client_id.to_string()) {
+                *wechat_guard = None;
+            }
+        }
+        {
+            let mut wecom_guard = self.wecom_client.write();
+            if wecom_guard.as_ref() == Some(&client_id.to_string()) {
+                *wecom_guard = None;
+            }
+        }
     }
 
-    /// Get target client for routing
+    /// Get target client for routing (fallback to default)
     fn get_target_client(&self) -> Result<String> {
         let guard = self.default_client.read();
         guard
             .clone()
             .ok_or_else(|| anyhow!("No connected clients available"))
+    }
+
+    /// Get target client for a specific channel
+    /// Routes WeChat messages to wechat_client, WeCom messages to wecom_client
+    /// Falls back to default_client if channel-specific client not set
+    fn get_target_client_for_channel(&self, channel: Channel) -> Result<String> {
+        match channel {
+            Channel::Wechat => {
+                let guard = self.wechat_client.read();
+                if let Some(ref client_id) = *guard {
+                    return Ok(client_id.clone());
+                }
+            }
+            Channel::Wecom => {
+                let guard = self.wecom_client.read();
+                if let Some(ref client_id) = *guard {
+                    return Ok(client_id.clone());
+                }
+            }
+        }
+        // Fallback to default client
+        self.get_target_client()
     }
 
     /// Clean up old pending responses (older than 30 seconds)

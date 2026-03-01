@@ -218,6 +218,102 @@ async fn handle_message(
         message.content
     );
 
+    // Handle kf_msg_or_event - need to fetch actual message via sync_msg API
+    if message.event.as_deref() == Some("kf_msg_or_event")
+        && let (Some(token), Some(open_kfid)) = (&message.kf_token, &message.open_kfid)
+    {
+        info!("Received kf_msg_or_event, calling sync_msg API with token");
+
+        // Get KF API client from broker
+        if let Some(kf_client) = &state.broker.kf_api {
+            match kf_client.sync_kf_messages(token, open_kfid).await {
+                Ok(sync_response) => {
+                    info!("Synced KF messages, has_more={:?}", sync_response.has_more);
+                    if let Some(msg_list) = sync_response.msg_list {
+                        info!("Processing {} KF messages", msg_list.len());
+                        
+                        // Bug fix: Only process the LATEST message (last in list, or highest send_time)
+                        // sync_msg returns messages from oldest to newest
+                        let latest_msg = msg_list.into_iter().rev().find(|m| {
+                            // Find the latest customer message (origin=3) with text content
+                            m.msgtype == "text" && m.origin == Some(3) && m.text.is_some()
+                        });
+                        
+                        if let Some(kf_msg) = latest_msg {
+                            info!(
+                                "Processing LATEST KF message: msgid={}, msgtype={}, external_user={:?}, send_time={}",
+                                kf_msg.msgid, kf_msg.msgtype, kf_msg.external_userid, kf_msg.send_time
+                            );
+
+                            let text = kf_msg.text.as_ref().unwrap();
+                            let external_user = kf_msg.external_userid.clone().unwrap_or_else(|| "unknown".to_string());
+                            let msg_open_kfid = kf_msg.open_kfid.clone().unwrap_or_else(|| open_kfid.clone());
+                            
+                            // Build WecomMessage from KF message
+                            let kf_message = WecomMessage {
+                                to_user_name: message.to_user_name.clone(),
+                                from_user_name: Some(external_user.clone()),
+                                create_time: Some(kf_msg.send_time as i64),
+                                msg_type: Some("text".to_string()),
+                                content: Some(text.content.clone()),
+                                msg_id: None, // KF msgid is string, WecomMessage expects i64
+                                agent_id: None,
+                                pic_url: None,
+                                media_id: None,
+                                format: None,
+                                recognition: None,
+                                thumb_media_id: None,
+                                location_x: None,
+                                location_y: None,
+                                scale: None,
+                                label: None,
+                                title: None,
+                                description: None,
+                                url: None,
+                                event: None,
+                                event_key: None,
+                                ticket: None,
+                                kf_token: Some(token.to_string()), // Store token for reply
+                                open_kfid: Some(msg_open_kfid.clone()),
+                                kf_msg_id: Some(kf_msg.msgid.clone()), // KF message ID for dedup
+                            };
+
+                            info!(
+                                "Forwarding KF text message from {}: {}",
+                                external_user, text.content
+                            );
+
+                            // Use fire-and-forget pattern for KF messages
+                            // WeCom expects immediate "success" response, reply comes via KF API
+                            let broker = state.broker.clone();
+                            let _body = body.clone();
+                            tokio::spawn(async move {
+                                // This will return immediately for KF messages
+                                // Response will be sent via KF API when LLM completes
+                                match broker.forward_wecom_message(kf_message, _body).await {
+                                    Ok(response) => {
+                                        debug!("KF message forwarded successfully: {}", response);
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to forward KF message: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to sync KF messages: {}", e);
+                }
+            }
+        } else {
+            warn!("KF API client not configured, cannot fetch KF message content");
+        }
+
+        // Return success immediately for KF events (WeCom expects quick response)
+        return Ok("success".to_string());
+    }
+
     // Forward to broker and wait for response
     let response_timeout = Duration::from_secs(state.config.message_timeout_secs);
 

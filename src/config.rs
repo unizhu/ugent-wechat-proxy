@@ -51,6 +51,10 @@ pub struct ProxyConfig {
     /// WeCom CorpSecret (for API calls)
     pub wecom_corp_secret: Option<String>,
 
+    /// WeCom KF Secret (for Customer Service API sync_msg)
+    /// This is a separate secret from CorpSecret
+    pub wecom_kf_secret: Option<String>,
+
     /// WeCom webhook server bind address
     #[serde(default = "default_wecom_webhook_addr")]
     pub wecom_webhook_addr: String,
@@ -137,6 +141,7 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|s| s.parse().ok()),
             wecom_corp_secret: std::env::var("WECOM_CORP_SECRET").ok(),
+            wecom_kf_secret: std::env::var("WECOM_KF_SECRET").ok(),
             wecom_webhook_addr: std::env::var("WECOM_WEBHOOK_ADDR")
                 .unwrap_or_else(|_| default_wecom_webhook_addr()),
 
