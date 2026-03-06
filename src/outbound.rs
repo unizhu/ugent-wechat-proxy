@@ -132,7 +132,7 @@ impl OutboundMediaHandler {
         }
 
         // Priority 2: Local file path
-        if let Some(ref path_str) = artifact.path {
+        if let Some(ref path_str) = artifact.local_path {
             let path = Path::new(path_str);
 
             // Validate path security:
@@ -186,9 +186,9 @@ impl OutboundMediaHandler {
     fn validate_size(&self, kind: &OutboundArtifactKind, size: usize) -> Result<()> {
         let max = match kind {
             OutboundArtifactKind::Image => MAX_IMAGE_SIZE,
-            OutboundArtifactKind::Voice => MAX_VOICE_SIZE,
+            OutboundArtifactKind::Audio => MAX_VOICE_SIZE,
             OutboundArtifactKind::Video => MAX_VIDEO_SIZE,
-            OutboundArtifactKind::File => self.max_file_size,
+            OutboundArtifactKind::Document | OutboundArtifactKind::Other => self.max_file_size,
         };
 
         if size > max {
@@ -216,9 +216,9 @@ impl OutboundMediaHandler {
     pub const fn kind_to_media_type(kind: &OutboundArtifactKind) -> &'static str {
         match kind {
             OutboundArtifactKind::Image => "image",
-            OutboundArtifactKind::Voice => "voice",
+            OutboundArtifactKind::Audio => "voice",
             OutboundArtifactKind::Video => "video",
-            OutboundArtifactKind::File => "file",
+            OutboundArtifactKind::Document | OutboundArtifactKind::Other => "file",
         }
     }
 }
@@ -234,7 +234,7 @@ mod tests {
             "image"
         );
         assert_eq!(
-            OutboundMediaHandler::kind_to_media_type(&OutboundArtifactKind::Voice),
+            OutboundMediaHandler::kind_to_media_type(&OutboundArtifactKind::Audio),
             "voice"
         );
         assert_eq!(
@@ -242,7 +242,7 @@ mod tests {
             "video"
         );
         assert_eq!(
-            OutboundMediaHandler::kind_to_media_type(&OutboundArtifactKind::File),
+            OutboundMediaHandler::kind_to_media_type(&OutboundArtifactKind::Document),
             "file"
         );
     }
