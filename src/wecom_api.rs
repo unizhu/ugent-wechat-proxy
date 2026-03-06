@@ -26,6 +26,18 @@ pub struct WecomApiResponse {
     pub errmsg: String,
 }
 
+/// Upload media response from /media/upload API
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadMediaResponse {
+    /// Error code (0 means success)
+    pub errcode: i64,
+    /// Error message
+    pub errmsg: String,
+    /// Media ID for sending
+    #[serde(default)]
+    pub media_id: Option<String>,
+}
+
 /// WeCom access token response
 #[derive(Debug, Clone, Deserialize)]
 struct WecomTokenResponse {
@@ -363,6 +375,154 @@ impl WecomApiClient {
         Ok(response)
     }
 
+    /// Upload media file to WeCom
+    ///
+    /// API: POST /media/upload?access_token=ACCESS_TOKEN&type={type}
+    /// Docs: https://developer.work.weixin.qq.com/document/path/91054
+    ///
+    /// # Arguments
+    /// * `media_type` - Media type: "image", "voice", "video", "file"
+    /// * `filename` - File name for display
+    /// * `data` - Binary file content
+    ///
+    /// # Returns
+    /// Returns `media_id` on success which can be used with `send_kf_media_message`
+    pub async fn upload_media(
+        &self,
+        media_type: &str,
+        filename: &str,
+        data: &[u8],
+    ) -> Result<UploadMediaResponse> {
+        let access_token = self.get_access_token().await?;
+
+        let url = format!(
+            "{}/media/upload?access_token={}&type={}",
+            WECOM_API_BASE, access_token, media_type
+        );
+
+        debug!(
+            "Uploading media: type={}, filename={}, size={} bytes",
+            media_type,
+            filename,
+            data.len()
+        );
+
+        // Build multipart form
+        let part = reqwest::multipart::Part::bytes(data.to_vec())
+            .file_name(filename.to_string())
+            .mime_str(Self::get_mime_type(media_type))
+            .map_err(|e| anyhow!("Failed to set MIME type: {}", e))?;
+
+        let form = reqwest::multipart::Form::new().part("media", part);
+
+        // Add timeout for media upload (60 seconds)
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self.http.post(&url).multipart(form).send(),
+        )
+        .await
+        .map_err(|_| anyhow!("Media upload timeout after 60s"))?
+        .map_err(|e| anyhow!("Media upload request failed: {}", e))?;
+
+        let upload_response: UploadMediaResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse upload response: {}", e))?;
+
+        if upload_response.errcode != 0 {
+            warn!(
+                "Failed to upload media: {} - {}",
+                upload_response.errcode, upload_response.errmsg
+            );
+            return Err(anyhow!(
+                "Media upload error {}: {}",
+                upload_response.errcode,
+                upload_response.errmsg
+            ));
+        }
+
+        info!(
+            "Uploaded media {} successfully, media_id={:?}",
+            filename, upload_response.media_id
+        );
+
+        Ok(upload_response)
+    }
+
+    /// Send KF media message (image, voice, video, file)
+    ///
+    /// API: POST /kf/send_msg?access_token=ACCESS_TOKEN
+    /// Docs: https://developer.work.weixin.qq.com/document/path/94677
+    ///
+    /// # Arguments
+    /// * `touser` - External user ID (customer)
+    /// * `open_kfid` - Customer service account ID
+    /// * `media_type` - Media type: "image", "voice", "video", "file"
+    /// * `media_id` - Media ID from `upload_media`
+    pub async fn send_kf_media_message(
+        &self,
+        touser: &str,
+        open_kfid: &str,
+        media_type: &str,
+        media_id: &str,
+    ) -> Result<WecomApiResponse> {
+        let access_token = self.get_access_token().await?;
+
+        let url = format!(
+            "{}/kf/send_msg?access_token={}",
+            WECOM_API_BASE, access_token
+        );
+
+        let body = serde_json::json!({
+            "touser": touser,
+            "open_kfid": open_kfid,
+            "msgtype": media_type,
+            media_type: {
+                "media_id": media_id
+            }
+        });
+
+        debug!(
+            "Sending KF {} message to user={}, open_kfid={}",
+            media_type, touser, open_kfid
+        );
+
+        let response = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?
+            .json::<WecomApiResponse>()
+            .await?;
+
+        if response.errcode != 0 {
+            warn!(
+                "Failed to send KF {} message: {} - {}",
+                media_type, response.errcode, response.errmsg
+            );
+            return Err(anyhow!(
+                "KF send_msg API error {}: {}",
+                response.errcode,
+                response.errmsg
+            ));
+        }
+
+        info!("Sent KF {} message to {} successfully", media_type, touser);
+        Ok(response)
+    }
+
+    /// Get MIME type for media type
+    fn get_mime_type(media_type: &str) -> &'static str {
+        match media_type {
+            "image" => "image/jpeg",
+            "voice" => "audio/amr",
+            "video" => "video/mp4",
+            "file" => "application/octet-stream",
+            _ => "application/octet-stream",
+        }
+    }
+
     /// Download media file from WeCom
     ///
     /// API: GET /media/get?access_token=ACCESS_TOKEN&media_id=MEDIA_ID
@@ -463,5 +623,32 @@ mod tests {
         let client = WecomApiClient::new("ww123456".to_string(), "secret123".to_string(), 1000002);
         assert_eq!(client.corp_id, "ww123456");
         assert_eq!(client.agent_id, 1000002);
+    }
+
+    #[test]
+    fn test_upload_media_response_deserialize() {
+        let json = r#"{
+            "errcode": 0,
+            "errmsg": "ok",
+            "media_id": "MEDIA_ID_123"
+        }"#;
+        let response: UploadMediaResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.errcode, 0);
+        assert_eq!(response.media_id, Some("MEDIA_ID_123".to_string()));
+    }
+
+    #[test]
+    fn test_get_mime_type() {
+        assert_eq!(WecomApiClient::get_mime_type("image"), "image/jpeg");
+        assert_eq!(WecomApiClient::get_mime_type("voice"), "audio/amr");
+        assert_eq!(WecomApiClient::get_mime_type("video"), "video/mp4");
+        assert_eq!(
+            WecomApiClient::get_mime_type("file"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            WecomApiClient::get_mime_type("unknown"),
+            "application/octet-stream"
+        );
     }
 }

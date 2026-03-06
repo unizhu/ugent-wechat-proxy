@@ -183,6 +183,7 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                             WsMessage::Response {
                                 original_id,
                                 content,
+                                artifacts,
                             } => {
                                 if !authenticated {
                                     warn!("Unauthenticated client tried to send response");
@@ -193,7 +194,7 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                                 if let Some(ref cid) = client_id
                                     && let Err(e) = ws_manager
                                         .broker
-                                        .handle_response(cid, original_id, content)
+                                        .handle_response(cid, original_id, content, artifacts)
                                         .await
                                 {
                                     error!("Error handling response: {}", e);
