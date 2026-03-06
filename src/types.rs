@@ -332,6 +332,47 @@ pub struct ClientAuth {
     pub api_key: String,
 }
 
+/// Outbound artifact kind (media type)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutboundArtifactKind {
+    /// Image file (JPG, PNG)
+    Image,
+    /// Voice file (AMR format, max 60s)
+    Voice,
+    /// Video file (MP4 format)
+    Video,
+    /// Generic file
+    File,
+}
+
+/// Outbound artifact from UGENT to send via WeCom
+///
+/// Supports sending media files (images, voice, video, files) through the proxy.
+/// The proxy will upload the file to WeCom and send it via KF API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundArtifact {
+    /// Type of artifact
+    pub kind: OutboundArtifactKind,
+    /// File name (for display purposes)
+    pub name: String,
+    /// Base64 encoded data (preferred for small files)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// Local file path (alternative to data, for large files)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Remote URL (optional, may be used as fallback)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// MIME type hint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Caption for the artifact
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
 /// WebSocket message types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -342,8 +383,14 @@ pub enum WsMessage {
     AuthResult { success: bool, message: String },
     /// Incoming message from WeChat or WeCom
     Message { data: Box<ProxyMessage> },
-    /// Response to a message
-    Response { original_id: Uuid, content: String },
+    /// Response to a message (updated with artifacts support)
+    Response {
+        original_id: Uuid,
+        content: String,
+        /// Artifacts to send (images, files, etc.)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<OutboundArtifact>,
+    },
     /// Heartbeat
     Ping,
     /// Heartbeat response
@@ -451,5 +498,74 @@ mod tests {
         assert_eq!(proxy.channel, Channel::Wecom);
         assert!(proxy.wechat_message.is_none());
         assert!(proxy.wecom_message.is_some());
+    }
+
+    #[test]
+    fn test_outbound_artifact_kind_serialize() {
+        let kind = OutboundArtifactKind::Image;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"image\"");
+
+        let kind = OutboundArtifactKind::Voice;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"voice\"");
+
+        let kind = OutboundArtifactKind::Video;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"video\"");
+
+        let kind = OutboundArtifactKind::File;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"file\"");
+    }
+
+    #[test]
+    fn test_outbound_artifact_serialization() {
+        let artifact = OutboundArtifact {
+            kind: OutboundArtifactKind::Image,
+            name: "test.jpg".to_string(),
+            data: Some("base64data".to_string()),
+            path: None,
+            url: None,
+            mime_type: Some("image/jpeg".to_string()),
+            caption: Some("Test image".to_string()),
+        };
+
+        let json = serde_json::to_string(&artifact).unwrap();
+        assert!(json.contains("\"kind\":\"image\""));
+        assert!(json.contains("\"name\":\"test.jpg\""));
+        assert!(json.contains("\"data\":\"base64data\""));
+
+        // Deserialize back
+        let decoded: OutboundArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.kind, OutboundArtifactKind::Image);
+        assert_eq!(decoded.name, "test.jpg");
+        assert_eq!(decoded.data, Some("base64data".to_string()));
+    }
+
+    #[test]
+    fn test_ws_message_with_artifacts() {
+        let msg = WsMessage::Response {
+            original_id: Uuid::nil(),
+            content: "Here is the file".to_string(),
+            artifacts: vec![OutboundArtifact {
+                kind: OutboundArtifactKind::File,
+                name: "document.pdf".to_string(),
+                data: Some("base64pdfdata".to_string()),
+                path: None,
+                url: None,
+                mime_type: None,
+                caption: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"response\""));
+        assert!(json.contains("\"artifacts\""));
+
+        // Deserialize back
+        let decoded: WsMessage = serde_json::from_str(&json).unwrap();
+        if let WsMessage::Response { artifacts, .. } = decoded {
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(artifacts[0].kind, OutboundArtifactKind::File);
+        } else {
+            panic!("Expected Response variant");
+        }
     }
 }

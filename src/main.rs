@@ -26,6 +26,7 @@ mod broker;
 mod config;
 mod crypto;
 mod media_cache;
+mod outbound;
 mod storage;
 mod types;
 mod webhook;

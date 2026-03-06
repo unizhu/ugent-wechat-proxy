@@ -14,7 +14,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::ProxyConfig;
-use crate::types::{Channel, MediaContent, ProxyMessage, WechatMessage, WecomMessage};
+use crate::types::{
+    Channel, MediaContent, OutboundArtifact, ProxyMessage, WechatMessage, WecomMessage,
+};
 use crate::wechat_api::{TemplateMessageData, WechatApiClient};
 use crate::wecom_api::WecomApiClient;
 
@@ -303,44 +305,105 @@ impl MessageBroker {
         _client_id: &str,
         original_id: Uuid,
         content: String,
+        artifacts: Vec<OutboundArtifact>,
     ) -> Result<()> {
-        debug!("Received response for message {} from client", original_id);
+        debug!(
+            "Received response for message {} from client (artifacts: {})",
+            original_id,
+            artifacts.len()
+        );
 
         if let Some((_, pending)) = self.pending.remove(&original_id) {
             // Check if this is a KF (Customer Service) message
             if let (Some(kf_open_kfid), Some(kf_api)) = (&pending.kf_open_kfid, &self.kf_api) {
                 // KF message - send via KF API, not XML response
                 info!(
-                    "Sending KF reply to user={}, open_kfid={}",
-                    pending.original_from_user, kf_open_kfid
+                    "Sending KF reply to user={}, open_kfid={} (text + {} artifacts)",
+                    pending.original_from_user,
+                    kf_open_kfid,
+                    artifacts.len()
                 );
 
-                match kf_api
-                    .send_kf_text_message(&pending.original_from_user, kf_open_kfid, &content)
-                    .await
-                {
-                    Ok(resp) if resp.errcode == 0 => {
-                        info!(
-                            "KF reply sent successfully to {}",
-                            pending.original_from_user
-                        );
-                    }
-                    Ok(resp) => {
-                        warn!(
-                            "Failed to send KF reply: {} - {}",
-                            resp.errcode, resp.errmsg
-                        );
-                    }
-                    Err(e) => {
-                        error!("Error sending KF reply: {}", e);
+                // 1. Send text message first
+                if !content.is_empty() {
+                    match kf_api
+                        .send_kf_text_message(&pending.original_from_user, kf_open_kfid, &content)
+                        .await
+                    {
+                        Ok(resp) if resp.errcode == 0 => {
+                            info!(
+                                "KF text reply sent successfully to {}",
+                                pending.original_from_user
+                            );
+                        }
+                        Ok(resp) => {
+                            warn!(
+                                "Failed to send KF reply: {} - {}",
+                                resp.errcode, resp.errmsg
+                            );
+                        }
+                        Err(e) => {
+                            error!("Error sending KF reply: {}", e);
+                        }
                     }
                 }
+
+                // 2. Send artifacts (images, files, etc.)
+                if !artifacts.is_empty() {
+                    use crate::outbound::OutboundMediaHandler;
+                    let handler = OutboundMediaHandler::new(kf_api.clone(), None);
+
+                    for (idx, artifact) in artifacts.iter().enumerate() {
+                        // Add delay between artifacts to avoid rate limiting
+                        // WeCom has a rate limit for API calls
+                        if idx > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+
+                        match handler
+                            .send_artifact(&pending.original_from_user, kf_open_kfid, artifact)
+                            .await
+                        {
+                            Ok(()) => {
+                                info!(
+                                    "Artifact {} sent to {}",
+                                    artifact.name, pending.original_from_user
+                                );
+                            }
+                            Err(e) => {
+                                error!("Failed to send artifact {}: {}", artifact.name, e);
+                                // Send fallback text description
+                                let fallback = format!("[附件: {}]", artifact.name);
+                                if let Err(e) = kf_api
+                                    .send_kf_text_message(
+                                        &pending.original_from_user,
+                                        kf_open_kfid,
+                                        &fallback,
+                                    )
+                                    .await
+                                {
+                                    error!("Failed to send artifact fallback text: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // For KF messages, we don't need to send via oneshot channel
                 // The reply is already sent via API
                 return Ok(());
             }
 
             // Non-KF message - build XML response
+            // Note: Artifacts are NOT supported for non-KF messages (XML response)
+            // Artifacts require KF API which is only available for KF messages
+            if !artifacts.is_empty() {
+                warn!(
+                    "Artifacts not supported for non-KF messages, {} artifact(s) ignored",
+                    artifacts.len()
+                );
+            }
+
             let response_xml = match pending.channel {
                 Channel::Wechat => build_wechat_response(
                     &pending.original_to_user,
