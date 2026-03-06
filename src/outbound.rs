@@ -137,12 +137,8 @@ impl OutboundMediaHandler {
 
             // Validate path security:
             // 1. No directory traversal (..)
-            // 2. No absolute paths (must be relative)
+            // 2. For absolute paths, only allow safe directories (OS temp)
             // 3. No prefix components (Windows drive letters)
-            if path.is_absolute() {
-                return Err(anyhow!("Invalid path: absolute paths not allowed"));
-            }
-
             if path.components().any(|c| {
                 matches!(
                     c,
@@ -150,6 +146,24 @@ impl OutboundMediaHandler {
                 )
             }) {
                 return Err(anyhow!("Invalid path: directory traversal not allowed"));
+            }
+
+            // For absolute paths, validate they are in safe directories
+            if path.is_absolute() {
+                let temp_dir = std::env::temp_dir();
+                let canonical_path = path
+                    .canonicalize()
+                    .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
+                let canonical_temp = temp_dir
+                    .canonicalize()
+                    .unwrap_or(temp_dir);
+
+                // Only allow files in OS temp directory for absolute paths
+                if !canonical_path.starts_with(&canonical_temp) {
+                    return Err(anyhow!(
+                        "Invalid path: absolute paths only allowed in temp directory"
+                    ));
+                }
             }
 
             // Use async file existence check (non-blocking)
