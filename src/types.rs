@@ -333,17 +333,22 @@ pub struct ClientAuth {
 }
 
 /// Outbound artifact kind (media type)
+/// This must match ugent-plugin-api's InboundAttachmentKind
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OutboundArtifactKind {
     /// Image file (JPG, PNG)
     Image,
-    /// Voice file (AMR format, max 60s)
-    Voice,
+    /// Audio file
+    #[serde(alias = "voice")]
+    Audio,
     /// Video file (MP4 format)
     Video,
-    /// Generic file
-    File,
+    /// Document file
+    Document,
+    /// Other file type
+    #[serde(alias = "file")]
+    Other,
 }
 
 /// Outbound artifact from UGENT to send via WeCom
@@ -359,18 +364,21 @@ pub struct OutboundArtifact {
     /// Base64 encoded data (preferred for small files)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
-    /// Local file path (alternative to data, for large files)
+    /// Local file path
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    pub local_path: Option<String>,
     /// Remote URL (optional, may be used as fallback)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// MIME type hint
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
+    pub content_type: Option<String>,
     /// Caption for the artifact
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+    /// Size in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
 }
 
 /// WebSocket message types
@@ -505,14 +513,29 @@ mod tests {
         let kind = OutboundArtifactKind::Image;
         assert_eq!(serde_json::to_string(&kind).unwrap(), "\"image\"");
 
-        let kind = OutboundArtifactKind::Voice;
-        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"voice\"");
+        let kind = OutboundArtifactKind::Audio;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"audio\"");
 
         let kind = OutboundArtifactKind::Video;
         assert_eq!(serde_json::to_string(&kind).unwrap(), "\"video\"");
 
-        let kind = OutboundArtifactKind::File;
-        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"file\"");
+        let kind = OutboundArtifactKind::Document;
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"document\"");
+    }
+
+    #[test]
+    fn test_outbound_artifact_kind_alias_deserialize() {
+        // Test that "voice" deserializes to Audio
+        let kind: OutboundArtifactKind = serde_json::from_str("\"voice\"").unwrap();
+        assert_eq!(kind, OutboundArtifactKind::Audio);
+
+        // Test that "file" deserializes to Other
+        let kind: OutboundArtifactKind = serde_json::from_str("\"file\"").unwrap();
+        assert_eq!(kind, OutboundArtifactKind::Other);
+
+        // Test that "audio" still works
+        let kind: OutboundArtifactKind = serde_json::from_str("\"audio\"").unwrap();
+        assert_eq!(kind, OutboundArtifactKind::Audio);
     }
 
     #[test]
@@ -521,10 +544,11 @@ mod tests {
             kind: OutboundArtifactKind::Image,
             name: "test.jpg".to_string(),
             data: Some("base64data".to_string()),
-            path: None,
+            local_path: None,
             url: None,
-            mime_type: Some("image/jpeg".to_string()),
+            content_type: Some("image/jpeg".to_string()),
             caption: Some("Test image".to_string()),
+            size_bytes: None,
         };
 
         let json = serde_json::to_string(&artifact).unwrap();
@@ -545,13 +569,14 @@ mod tests {
             original_id: Uuid::nil(),
             content: "Here is the file".to_string(),
             artifacts: vec![OutboundArtifact {
-                kind: OutboundArtifactKind::File,
+                kind: OutboundArtifactKind::Document,
                 name: "document.pdf".to_string(),
                 data: Some("base64pdfdata".to_string()),
-                path: None,
+                local_path: None,
                 url: None,
-                mime_type: None,
+                content_type: None,
                 caption: None,
+                size_bytes: None,
             }],
         };
 
@@ -563,7 +588,7 @@ mod tests {
         let decoded: WsMessage = serde_json::from_str(&json).unwrap();
         if let WsMessage::Response { artifacts, .. } = decoded {
             assert_eq!(artifacts.len(), 1);
-            assert_eq!(artifacts[0].kind, OutboundArtifactKind::File);
+            assert_eq!(artifacts[0].kind, OutboundArtifactKind::Document);
         } else {
             panic!("Expected Response variant");
         }
