@@ -308,6 +308,47 @@ async fn handle_message(
                                         image.media_id, image.cos_url, image.file_size
                                     );
 
+                                    // Check for duplicate before spawning background task
+                                    let is_new = if let Some(storage) = &state.storage {
+                                        use crate::storage::KfMessage as StoredKfMessage;
+                                        let stored_msg = StoredKfMessage::new(
+                                            kf_msg.msgid.clone(),
+                                            msg_open_kfid.clone(),
+                                            external_user.clone(),
+                                            "image".to_string(),
+                                            None,
+                                            Some(3),
+                                            kf_msg.send_time as i64,
+                                        );
+                                        match storage.save_message(&stored_msg) {
+                                            Ok(true) => {
+                                                debug!("Saved KF image message to storage");
+                                                true
+                                            }
+                                            Ok(false) => {
+                                                info!(
+                                                    "KF image message {} already in storage, skipping duplicate",
+                                                    kf_msg.msgid
+                                                );
+                                                false
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to save KF image message: {}", e);
+                                                true // Process anyway on error
+                                            }
+                                        }
+                                    } else {
+                                        true
+                                    };
+
+                                    if !is_new {
+                                        info!(
+                                            "Skipping duplicate KF image message: msgid={}",
+                                            kf_msg.msgid
+                                        );
+                                        return Ok("success".to_string());
+                                    }
+
                                     // Clone necessary data for background processing
                                     let state_clone = state.clone();
                                     let message_clone = message.clone();
@@ -459,8 +500,8 @@ async fn process_kf_text_message(
         external_user, text_content
     );
 
-    // Save message to storage
-    save_kf_message_to_storage(
+    // Save message to storage - check if it's a duplicate
+    let is_new = save_kf_message_to_storage(
         state,
         kf_msg,
         msg_open_kfid,
@@ -470,8 +511,12 @@ async fn process_kf_text_message(
         sync_response,
     );
 
-    // Forward to broker
-    forward_kf_message_to_broker(&state.broker, kf_message, body.to_string());
+    // Only forward if it's a new message (not duplicate)
+    if is_new {
+        forward_kf_message_to_broker(&state.broker, kf_message, body.to_string());
+    } else {
+        info!("Skipping duplicate KF text message: msgid={}", kf_msg.msgid);
+    }
 }
 
 /// Process KF image message in background (spawned task)
@@ -633,8 +678,8 @@ async fn process_kf_voice_message(
         external_user, media_id, local_path
     );
 
-    // Save message to storage
-    save_kf_message_to_storage(
+    // Save message to storage - check if it's a duplicate
+    let is_new = save_kf_message_to_storage(
         state,
         kf_msg,
         msg_open_kfid,
@@ -644,14 +689,27 @@ async fn process_kf_voice_message(
         sync_response,
     );
 
-    // Forward to broker with media content
-    let media_content = MediaContent::Voice {
-        media_id: media_id.to_string(),
-        local_path: Some(local_path.to_string_lossy().to_string()),
-        data: Some(base64_data),
-        format: Some("amr".to_string()),
-    };
-    forward_kf_media_message_to_broker(&state.broker, kf_message, body.to_string(), media_content);
+    // Only forward if it's a new message (not duplicate)
+    if is_new {
+        // Forward to broker with media content
+        let media_content = MediaContent::Voice {
+            media_id: media_id.to_string(),
+            local_path: Some(local_path.to_string_lossy().to_string()),
+            data: Some(base64_data),
+            format: Some("amr".to_string()),
+        };
+        forward_kf_media_message_to_broker(
+            &state.broker,
+            kf_message,
+            body.to_string(),
+            media_content,
+        );
+    } else {
+        info!(
+            "Skipping duplicate KF voice message: msgid={}",
+            kf_msg.msgid
+        );
+    }
 }
 
 /// Download media from WeCom
@@ -674,6 +732,8 @@ async fn download_media(state: &WecomWebhookState, media_id: &str) -> Option<Vec
 }
 
 /// Save KF message to storage
+/// Save KF message to storage and return whether it's a new message
+/// Returns true if the message was newly inserted, false if it was a duplicate
 fn save_kf_message_to_storage(
     state: &WecomWebhookState,
     kf_msg: &KfMessage,
@@ -682,7 +742,7 @@ fn save_kf_message_to_storage(
     msg_type: &str,
     content: Option<&str>,
     sync_response: &crate::wecom_api::KfSyncMsgResponse,
-) {
+) -> bool {
     if let Some(storage) = &state.storage {
         use crate::storage::KfMessage as StoredKfMessage;
         let stored_msg = StoredKfMessage::new(
@@ -695,24 +755,35 @@ fn save_kf_message_to_storage(
             kf_msg.send_time as i64,
         );
         match storage.save_message(&stored_msg) {
-            Ok(true) => debug!("Saved KF message to storage"),
+            Ok(true) => {
+                debug!("Saved KF message to storage");
+                return true;
+            }
             Ok(false) => {
                 info!(
                     "KF message {} already in storage, skipping duplicate",
                     kf_msg.msgid
                 );
+                return false;
             }
-            Err(e) => warn!("Failed to save KF message: {}", e),
+            Err(e) => {
+                warn!("Failed to save KF message: {}", e);
+                // On error, still process the message to avoid losing it
+                return true;
+            }
         }
-
-        // Update sync cursor
-        if let Some(cursor) = &sync_response.next_cursor {
-            debug!("Got sync cursor: {}", cursor);
-        }
-
-        // Note: conversation tracking handled by message dedup
-        let _ = (msg_open_kfid, external_user, &kf_msg.msgid);
     }
+
+    // Update sync cursor
+    if let Some(cursor) = &sync_response.next_cursor {
+        debug!("Got sync cursor: {}", cursor);
+    }
+
+    // Note: conversation tracking handled by message dedup
+    let _ = (msg_open_kfid, external_user, &kf_msg.msgid);
+
+    // No storage configured, treat as new message
+    true
 }
 
 /// Forward KF text message to broker (fire-and-forget)
