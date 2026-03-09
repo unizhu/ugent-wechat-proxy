@@ -154,9 +154,7 @@ impl OutboundMediaHandler {
                 let canonical_path = path
                     .canonicalize()
                     .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
-                let canonical_temp = temp_dir
-                    .canonicalize()
-                    .unwrap_or(temp_dir);
+                let canonical_temp = temp_dir.canonicalize().unwrap_or(temp_dir);
 
                 // Only allow files in OS temp directory for absolute paths
                 if !canonical_path.starts_with(&canonical_temp) {
