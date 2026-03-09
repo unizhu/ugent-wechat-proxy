@@ -227,193 +227,40 @@ async fn handle_message(
     );
 
     // Handle kf_msg_or_event - need to fetch actual message via sync_msg API
+    // IMPORTANT: Return success immediately to WeCom (within 5 seconds)
+    // and process sync_msg in background to avoid WeCom retry
     if message.event.as_deref() == Some("kf_msg_or_event")
         && let (Some(token), Some(open_kfid)) = (&message.kf_token, &message.open_kfid)
     {
-        info!("Received kf_msg_or_event, calling sync_msg API with token");
+        info!("Received kf_msg_or_event, will process sync_msg in background");
 
-        // Get KF API client from broker
+        // Check if KF API client is available
         if let Some(kf_client) = &state.broker.kf_api {
-            match kf_client.sync_kf_messages(token, open_kfid).await {
-                Ok(sync_response) => {
-                    info!("Synced KF messages, has_more={:?}", sync_response.has_more);
-                    if let Some(ref msg_list) = sync_response.msg_list {
-                        info!("Processing {} KF messages", msg_list.len());
+            // Clone everything needed for background processing
+            let kf_client = kf_client.clone();
+            let token = token.clone();
+            let open_kfid = open_kfid.clone();
+            let state = state.clone();
+            let message = message.clone();
+            let body = body.to_string();
 
-                        // Debug: log all messages with their types and origins
-                        for (idx, m) in msg_list.iter().enumerate() {
-                            debug!(
-                                "KF msg[{}]: msgid={}, msgtype={}, origin={:?}, external_user={:?}, send_time={}, has_text={}, has_image={}, has_voice={}",
-                                idx,
-                                m.msgid,
-                                m.msgtype,
-                                m.origin,
-                                m.external_userid,
-                                m.send_time,
-                                m.text.is_some(),
-                                m.image.is_some(),
-                                m.voice.is_some()
-                            );
-                        }
-
-                        // Bug fix: Only process the LATEST message (last in list, or highest send_time)
-                        // sync_msg returns messages from oldest to newest
-                        let latest_msg = msg_list.iter().rev().find(|m| {
-                            // Find the latest customer message (origin=3) with any content type
-                            m.origin == Some(3)
-                                && ((m.msgtype == "text" && m.text.is_some())
-                                    || (m.msgtype == "image" && m.image.is_some())
-                                    || (m.msgtype == "voice" && m.voice.is_some()))
-                        });
-
-                        if let Some(kf_msg) = latest_msg {
-                            info!(
-                                "Processing LATEST KF message: msgid={}, msgtype={}, external_user={:?}, send_time={}",
-                                kf_msg.msgid,
-                                kf_msg.msgtype,
-                                kf_msg.external_userid,
-                                kf_msg.send_time
-                            );
-
-                            let external_user = kf_msg
-                                .external_userid
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            let msg_open_kfid = kf_msg
-                                .open_kfid
-                                .clone()
-                                .unwrap_or_else(|| open_kfid.clone());
-
-                            // Process based on message type
-                            match kf_msg.msgtype.as_str() {
-                                "text" => {
-                                    let text = kf_msg.text.as_ref().unwrap();
-                                    process_kf_text_message(
-                                        &state,
-                                        &message,
-                                        kf_msg,
-                                        &body,
-                                        &external_user,
-                                        &msg_open_kfid,
-                                        token,
-                                        &text.content,
-                                        &sync_response,
-                                    )
-                                    .await;
-                                }
-                                "image" => {
-                                    let image = kf_msg.image.as_ref().unwrap();
-                                    info!(
-                                        "Processing image message: media_id={:?}, cos_url={:?}, file_size={:?}",
-                                        image.media_id, image.cos_url, image.file_size
-                                    );
-
-                                    // Check for duplicate before spawning background task
-                                    let is_new = if let Some(storage) = &state.storage {
-                                        use crate::storage::KfMessage as StoredKfMessage;
-                                        let stored_msg = StoredKfMessage::new(
-                                            kf_msg.msgid.clone(),
-                                            msg_open_kfid.clone(),
-                                            external_user.clone(),
-                                            "image".to_string(),
-                                            None,
-                                            Some(3),
-                                            kf_msg.send_time as i64,
-                                        );
-                                        match storage.save_message(&stored_msg) {
-                                            Ok(true) => {
-                                                debug!("Saved KF image message to storage");
-                                                true
-                                            }
-                                            Ok(false) => {
-                                                info!(
-                                                    "KF image message {} already in storage, skipping duplicate",
-                                                    kf_msg.msgid
-                                                );
-                                                false
-                                            }
-                                            Err(e) => {
-                                                warn!("Failed to save KF image message: {}", e);
-                                                true // Process anyway on error
-                                            }
-                                        }
-                                    } else {
-                                        true
-                                    };
-
-                                    if !is_new {
-                                        info!(
-                                            "Skipping duplicate KF image message: msgid={}",
-                                            kf_msg.msgid
-                                        );
-                                        return Ok("success".to_string());
-                                    }
-
-                                    // Clone necessary data for background processing
-                                    let state_clone = state.clone();
-                                    let message_clone = message.clone();
-                                    let kf_msg_clone = kf_msg.clone();
-                                    let body_clone = body.to_string();
-                                    let external_user_clone = external_user.to_string();
-                                    let msg_open_kfid_clone = msg_open_kfid.to_string();
-                                    let token_clone = token.to_string();
-                                    let media_id_clone = image.media_id.clone();
-
-                                    // Spawn background task to download and process image
-                                    tokio::spawn(async move {
-                                        process_kf_image_message_spawned(
-                                            &state_clone,
-                                            &message_clone,
-                                            &kf_msg_clone,
-                                            &body_clone,
-                                            &external_user_clone,
-                                            &msg_open_kfid_clone,
-                                            &token_clone,
-                                            &media_id_clone,
-                                        )
-                                        .await;
-                                    });
-                                    info!(
-                                        "Spawned background task for image download: media_id={}",
-                                        image.media_id
-                                    );
-                                }
-                                "voice" => {
-                                    let voice = kf_msg.voice.as_ref().unwrap();
-                                    process_kf_voice_message(
-                                        &state,
-                                        &message,
-                                        kf_msg,
-                                        &body,
-                                        &external_user,
-                                        &msg_open_kfid,
-                                        token,
-                                        &voice.media_id,
-                                        &sync_response,
-                                    )
-                                    .await;
-                                }
-                                _ => {
-                                    warn!("Unsupported KF message type: {}", kf_msg.msgtype);
-                                }
-                            }
-                            return Ok("success".to_string());
-                        } else {
-                            warn!(
-                                "No matching KF message found (origin=3 with text/image/voice content)"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to sync KF messages: {}", e);
-                }
-            }
+            // Spawn background task to call sync_msg and process messages
+            tokio::spawn(async move {
+                process_kf_sync_msg_background(
+                    &kf_client,
+                    &state,
+                    &message,
+                    &body,
+                    &token,
+                    &open_kfid,
+                )
+                .await;
+            });
         } else {
             warn!("KF API client not configured, cannot fetch KF message content");
         }
 
-        // Return success immediately for KF events (WeCom expects quick response)
+        // Return success immediately for KF events (WeCom expects quick response < 5s)
         return Ok("success".to_string());
     }
 
@@ -453,6 +300,193 @@ use crate::media_cache::MediaCache;
 use crate::types::MediaContent;
 use crate::wecom_api::KfMessage;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+/// Process KF sync_msg in background (spawned from webhook handler)
+/// This allows the webhook to return success immediately to WeCom (< 5s)
+/// while we fetch and process messages asynchronously
+async fn process_kf_sync_msg_background(
+    kf_client: &crate::wecom_api::WecomApiClient,
+    state: &WecomWebhookState,
+    original_message: &WecomMessage,
+    body: &str,
+    token: &str,
+    open_kfid: &str,
+) {
+    match kf_client.sync_kf_messages(token, open_kfid).await {
+        Ok(sync_response) => {
+            info!("Synced KF messages, has_more={:?}", sync_response.has_more);
+            if let Some(ref msg_list) = sync_response.msg_list {
+                info!("Processing {} KF messages in background", msg_list.len());
+
+                // Debug: log all messages with their types and origins
+                for (idx, m) in msg_list.iter().enumerate() {
+                    debug!(
+                        "KF msg[{}]: msgid={}, msgtype={}, origin={:?}, external_user={:?}, send_time={}, has_text={}, has_image={}, has_voice={}",
+                        idx,
+                        m.msgid,
+                        m.msgtype,
+                        m.origin,
+                        m.external_userid,
+                        m.send_time,
+                        m.text.is_some(),
+                        m.image.is_some(),
+                        m.voice.is_some()
+                    );
+                }
+
+                // Only process the LATEST message (last in list, or highest send_time)
+                // sync_msg returns messages from oldest to newest
+                let latest_msg = msg_list.iter().rev().find(|m| {
+                    // Find the latest customer message (origin=3) with any content type
+                    m.origin == Some(3)
+                        && ((m.msgtype == "text" && m.text.is_some())
+                            || (m.msgtype == "image" && m.image.is_some())
+                            || (m.msgtype == "voice" && m.voice.is_some()))
+                });
+
+                if let Some(kf_msg) = latest_msg {
+                    info!(
+                        "Processing LATEST KF message in background: msgid={}, msgtype={}, external_user={:?}, send_time={}",
+                        kf_msg.msgid,
+                        kf_msg.msgtype,
+                        kf_msg.external_userid,
+                        kf_msg.send_time
+                    );
+
+                    let external_user = kf_msg
+                        .external_userid
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let msg_open_kfid = kf_msg
+                        .open_kfid
+                        .clone()
+                        .unwrap_or_else(|| open_kfid.to_string());
+
+                    // Process based on message type
+                    match kf_msg.msgtype.as_str() {
+                        "text" => {
+                            let text = kf_msg.text.as_ref().unwrap();
+                            process_kf_text_message(
+                                state,
+                                original_message,
+                                kf_msg,
+                                body,
+                                &external_user,
+                                &msg_open_kfid,
+                                token,
+                                &text.content,
+                                &sync_response,
+                            )
+                            .await;
+                        }
+                        "image" => {
+                            let image = kf_msg.image.as_ref().unwrap();
+                            info!(
+                                "Processing image message: media_id={:?}, cos_url={:?}, file_size={:?}",
+                                image.media_id, image.cos_url, image.file_size
+                            );
+
+                            // Check for duplicate before spawning background task
+                            let is_new = if let Some(storage) = &state.storage {
+                                use crate::storage::KfMessage as StoredKfMessage;
+                                let stored_msg = StoredKfMessage::new(
+                                    kf_msg.msgid.clone(),
+                                    msg_open_kfid.clone(),
+                                    external_user.clone(),
+                                    "image".to_string(),
+                                    None,
+                                    Some(3),
+                                    kf_msg.send_time as i64,
+                                );
+                                match storage.save_message(&stored_msg) {
+                                    Ok(true) => {
+                                        debug!("Saved KF image message to storage");
+                                        true
+                                    }
+                                    Ok(false) => {
+                                        info!(
+                                            "KF image message {} already in storage, skipping duplicate",
+                                            kf_msg.msgid
+                                        );
+                                        false
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to save KF image message: {}", e);
+                                        true // Process anyway on error
+                                    }
+                                }
+                            } else {
+                                true
+                            };
+
+                            if !is_new {
+                                info!(
+                                    "Skipping duplicate KF image message: msgid={}",
+                                    kf_msg.msgid
+                                );
+                                return;
+                            }
+
+                            // Clone necessary data for background processing
+                            let state_clone = state.clone();
+                            let message_clone = original_message.clone();
+                            let kf_msg_clone = kf_msg.clone();
+                            let body_clone = body.to_string();
+                            let external_user_clone = external_user.to_string();
+                            let msg_open_kfid_clone = msg_open_kfid.to_string();
+                            let token_clone = token.to_string();
+                            let media_id_clone = image.media_id.clone();
+
+                            // Spawn background task to download and process image
+                            tokio::spawn(async move {
+                                process_kf_image_message_spawned(
+                                    &state_clone,
+                                    &message_clone,
+                                    &kf_msg_clone,
+                                    &body_clone,
+                                    &external_user_clone,
+                                    &msg_open_kfid_clone,
+                                    &token_clone,
+                                    &media_id_clone,
+                                )
+                                .await;
+                            });
+                            info!(
+                                "Spawned background task for image download: media_id={}",
+                                image.media_id
+                            );
+                        }
+                        "voice" => {
+                            let voice = kf_msg.voice.as_ref().unwrap();
+                            process_kf_voice_message(
+                                state,
+                                original_message,
+                                kf_msg,
+                                body,
+                                &external_user,
+                                &msg_open_kfid,
+                                token,
+                                &voice.media_id,
+                                &sync_response,
+                            )
+                            .await;
+                        }
+                        _ => {
+                            warn!("Unsupported KF message type: {}", kf_msg.msgtype);
+                        }
+                    }
+                } else {
+                    warn!(
+                        "No matching KF message found (origin=3 with text/image/voice content)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to sync KF messages in background: {}", e);
+        }
+    }
+}
 
 /// Process KF text message
 async fn process_kf_text_message(
@@ -495,11 +529,6 @@ async fn process_kf_text_message(
         kf_msg_id: Some(kf_msg.msgid.clone()),
     };
 
-    info!(
-        "Forwarding KF text message from {}: {}",
-        external_user, text_content
-    );
-
     // Save message to storage - check if it's a duplicate
     let is_new = save_kf_message_to_storage(
         state,
@@ -513,6 +542,10 @@ async fn process_kf_text_message(
 
     // Only forward if it's a new message (not duplicate)
     if is_new {
+        info!(
+            "Forwarding KF text message from {}: {}",
+            external_user, text_content
+        );
         forward_kf_message_to_broker(&state.broker, kf_message, body.to_string());
     } else {
         info!("Skipping duplicate KF text message: msgid={}", kf_msg.msgid);
