@@ -75,19 +75,24 @@ impl OutboundMediaHandler {
         open_kfid: &str,
         artifact: &OutboundArtifact,
     ) -> Result<()> {
+        // 0. Auto-detect kind from file extension if generic
+        let effective_kind = Self::infer_kind_from_extension(&artifact.kind, &artifact.name);
+        // MIME hint from extension (reserved for future upload_media_with_mime support)
+        let _mime_hint = Self::mime_hint_for_extension(&artifact.name);
+
         debug!(
-            "Processing outbound artifact: kind={:?}, name={}",
-            artifact.kind, artifact.name
+            "Processing outbound artifact: kind={:?}, effective_kind={:?}, name={}",
+            artifact.kind, effective_kind, artifact.name
         );
 
         // 1. Get artifact data
         let data = self.get_artifact_data(artifact).await?;
 
-        // 2. Validate size
-        self.validate_size(&artifact.kind, data.len())?;
+        // 2. Validate size (use effective kind for correct limits)
+        self.validate_size(&effective_kind, data.len())?;
 
-        // 3. Get media type string
-        let media_type = Self::kind_to_media_type(&artifact.kind);
+        // 3. Get media type string from effective kind
+        let media_type = Self::kind_to_media_type(&effective_kind);
 
         // 4. Upload to WeCom
         let upload_response = self
@@ -190,6 +195,88 @@ impl OutboundMediaHandler {
             "Artifact {} has no data, path, or URL",
             artifact.name
         ))
+    }
+
+    /// Infer artifact kind from file extension when kind is generic.
+    ///
+    /// This allows the proxy to send native voice messages even when
+    /// the sender only specifies a generic file type.
+    ///
+    /// Mapping:
+    /// - .amr → Audio (WeCom voice format)
+    /// - .jpg/.jpeg/.png/.gif/.bmp/.webp → Image
+    /// - .mp4/.mov/.avi/.mkv → Video
+    /// - .mp3/.wav/.ogg/.m4a/.flac/.aac → Audio
+    #[must_use]
+    pub fn infer_kind_from_extension(
+        current_kind: &OutboundArtifactKind,
+        filename: &str,
+    ) -> OutboundArtifactKind {
+        // If already a specific type, trust the sender
+        match current_kind {
+            OutboundArtifactKind::Image
+            | OutboundArtifactKind::Audio
+            | OutboundArtifactKind::Video => return *current_kind,
+            OutboundArtifactKind::Document | OutboundArtifactKind::Other => {}
+        }
+
+        let ext = filename
+            .rsplit('.')
+            .next()
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        match ext.as_str() {
+            // WeCom voice: AMR format (primary)
+            "amr" => OutboundArtifactKind::Audio,
+            // Common audio formats (treated as voice by WeCom after upload)
+            "mp3" | "wav" | "ogg" | "m4a" | "flac" | "aac" | "wma" => OutboundArtifactKind::Audio,
+            // Image formats
+            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tiff"
+            | "tif" => OutboundArtifactKind::Image,
+            // Video formats
+            "mp4" | "mov" | "avi" | "mkv" | "webm" | "flv" | "wmv" | "m4v" => {
+                OutboundArtifactKind::Video
+            }
+            // Unknown extension → keep original kind
+            _ => *current_kind,
+        }
+    }
+
+    /// Get MIME type hint from file extension.
+    ///
+    /// This is used to override the default MIME type from kind_to_media_type()
+    /// when the file extension provides more specific type information.
+    #[must_use]
+    pub fn mime_hint_for_extension(filename: &str) -> Option<&'static str> {
+        let ext = filename
+            .rsplit('.')
+            .next()
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        match ext.as_str() {
+            "amr" => Some("audio/amr"),
+            "mp3" => Some("audio/mpeg"),
+            "wav" => Some("audio/wav"),
+            "ogg" => Some("audio/ogg"),
+            "m4a" => Some("audio/mp4"),
+            "flac" => Some("audio/flac"),
+            "aac" => Some("audio/aac"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "png" => Some("image/png"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "bmp" => Some("image/bmp"),
+            "svg" => Some("image/svg+xml"),
+            "mp4" => Some("video/mp4"),
+            "mov" => Some("video/quicktime"),
+            "avi" => Some("video/x-msvideo"),
+            "mkv" => Some("video/x-matroska"),
+            "webm" => Some("video/webm"),
+            "pdf" => Some("application/pdf"),
+            _ => None,
+        }
     }
 
     /// Validate file size against WeCom limits
@@ -298,5 +385,134 @@ mod tests {
         assert!((MAX_VOICE_SIZE + 1) > MAX_VOICE_SIZE);
         assert!((MAX_VIDEO_SIZE + 1) > MAX_VIDEO_SIZE);
         assert!((MAX_FILE_SIZE + 1) > MAX_FILE_SIZE);
+    }
+
+    #[test]
+    fn test_infer_kind_from_extension_amr() {
+        // AMR should be detected as Audio
+        assert_eq!(
+            OutboundMediaHandler::infer_kind_from_extension(
+                &OutboundArtifactKind::Document,
+                "voice_message.amr"
+            ),
+            OutboundArtifactKind::Audio
+        );
+    }
+
+    #[test]
+    fn test_infer_kind_from_extension_audio_formats() {
+        for ext in ["mp3", "wav", "ogg", "m4a", "flac", "aac", "wma"] {
+            assert_eq!(
+                OutboundMediaHandler::infer_kind_from_extension(
+                    &OutboundArtifactKind::Other,
+                    &format!("file.{}", ext)
+                ),
+                OutboundArtifactKind::Audio,
+                "Expected {} to be Audio",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_kind_from_extension_image_formats() {
+        for ext in ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"] {
+            assert_eq!(
+                OutboundMediaHandler::infer_kind_from_extension(
+                    &OutboundArtifactKind::Document,
+                    &format!("photo.{}", ext)
+                ),
+                OutboundArtifactKind::Image,
+                "Expected {} to be Image",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_kind_from_extension_video_formats() {
+        for ext in ["mp4", "mov", "avi", "mkv", "webm"] {
+            assert_eq!(
+                OutboundMediaHandler::infer_kind_from_extension(
+                    &OutboundArtifactKind::Other,
+                    &format!("video.{}", ext)
+                ),
+                OutboundArtifactKind::Video,
+                "Expected {} to be Video",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_kind_preserves_specific_kind() {
+        // When kind is already specific, don't override
+        assert_eq!(
+            OutboundMediaHandler::infer_kind_from_extension(
+                &OutboundArtifactKind::Image,
+                "photo.txt"
+            ),
+            OutboundArtifactKind::Image
+        );
+        assert_eq!(
+            OutboundMediaHandler::infer_kind_from_extension(
+                &OutboundArtifactKind::Audio,
+                "audio.pdf"
+            ),
+            OutboundArtifactKind::Audio
+        );
+    }
+
+    #[test]
+    fn test_infer_kind_unknown_extension() {
+        assert_eq!(
+            OutboundMediaHandler::infer_kind_from_extension(
+                &OutboundArtifactKind::Document,
+                "report.xyz"
+            ),
+            OutboundArtifactKind::Document
+        );
+    }
+
+    #[test]
+    fn test_mime_hint_for_extension() {
+        assert_eq!(
+            OutboundMediaHandler::mime_hint_for_extension("voice.amr"),
+            Some("audio/amr")
+        );
+        assert_eq!(
+            OutboundMediaHandler::mime_hint_for_extension("photo.jpg"),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            OutboundMediaHandler::mime_hint_for_extension("video.mp4"),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            OutboundMediaHandler::mime_hint_for_extension("doc.pdf"),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            OutboundMediaHandler::mime_hint_for_extension("file.xyz"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_infer_kind_case_insensitive() {
+        assert_eq!(
+            OutboundMediaHandler::infer_kind_from_extension(
+                &OutboundArtifactKind::Document,
+                "voice.AMR"
+            ),
+            OutboundArtifactKind::Audio
+        );
+        assert_eq!(
+            OutboundMediaHandler::infer_kind_from_extension(
+                &OutboundArtifactKind::Document,
+                "photo.JPG"
+            ),
+            OutboundArtifactKind::Image
+        );
     }
 }
