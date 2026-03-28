@@ -37,6 +37,8 @@ pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow:
         _ => None,
     };
 
+    let webhook_path = config.wechat_webhook_path.clone();
+
     let state = WebhookState {
         config,
         broker,
@@ -45,7 +47,7 @@ pub async fn run_server(addr: SocketAddr, broker: Arc<MessageBroker>) -> anyhow:
 
     let app = Router::new()
         // WeChat webhook endpoint
-        .route("/wechat/webhook", get(verify).post(handle_message))
+        .route(&webhook_path, get(verify).post(handle_message))
         .route("/health", get(health_check))
         .layer(middleware::from_fn(log_request))
         .with_state(state);

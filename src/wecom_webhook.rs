@@ -62,6 +62,8 @@ pub async fn run_server(
         }
     };
 
+    let callback_path = config.wecom_callback_path.clone();
+
     let state = WecomWebhookState {
         config,
         broker,
@@ -71,7 +73,7 @@ pub async fn run_server(
 
     let app = Router::new()
         // WeCom webhook endpoint
-        .route("/wecom/callback", get(verify_url).post(handle_message))
+        .route(&callback_path, get(verify_url).post(handle_message))
         .route("/health", get(health_check))
         .with_state(state);
 

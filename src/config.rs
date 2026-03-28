@@ -29,6 +29,10 @@ pub struct ProxyConfig {
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
 
+    /// WeChat OA webhook route path
+    #[serde(default = "default_wechat_webhook_path")]
+    pub wechat_webhook_path: String,
+
     // =========================================================================
     // WeCom (企业微信) Configuration
     // =========================================================================
@@ -58,6 +62,10 @@ pub struct ProxyConfig {
     /// WeCom webhook server bind address
     #[serde(default = "default_wecom_webhook_addr")]
     pub wecom_webhook_addr: String,
+
+    /// WeCom webhook callback route path
+    #[serde(default = "default_wecom_callback_path")]
+    pub wecom_callback_path: String,
 
     // =========================================================================
     // Common Configuration
@@ -120,6 +128,14 @@ fn default_wecom_webhook_addr() -> String {
     "0.0.0.0:8082".to_string()
 }
 
+fn default_wechat_webhook_path() -> String {
+    "/wechat/webhook".to_string()
+}
+
+fn default_wecom_callback_path() -> String {
+    "/wecom/callback".to_string()
+}
+
 fn default_websocket_addr() -> String {
     "0.0.0.0:8081".to_string()
 }
@@ -166,6 +182,8 @@ impl ProxyConfig {
             wechat_app_secret: std::env::var("WECHAT_APP_SECRET").ok(),
             template_id_response_ready: std::env::var("WECHAT_TEMPLATE_RESPONSE_READY").ok(),
             webhook_addr: std::env::var("WEBHOOK_ADDR").unwrap_or_else(|_| default_webhook_addr()),
+            wechat_webhook_path: std::env::var("WECHAT_WEBHOOK_PATH")
+                .unwrap_or_else(|_| default_wechat_webhook_path()),
 
             // WeCom config
             wecom_enabled: std::env::var("WECOM_ENABLED").is_ok(),
@@ -179,6 +197,8 @@ impl ProxyConfig {
             wecom_kf_secret: std::env::var("WECOM_KF_SECRET").ok(),
             wecom_webhook_addr: std::env::var("WECOM_WEBHOOK_ADDR")
                 .unwrap_or_else(|_| default_wecom_webhook_addr()),
+            wecom_callback_path: std::env::var("WECOM_CALLBACK_PATH")
+                .unwrap_or_else(|_| default_wecom_callback_path()),
 
             // Common config
             websocket_addr: std::env::var("WEBSOCKET_ADDR")
