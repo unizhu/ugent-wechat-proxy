@@ -196,6 +196,35 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                                         .await;
 
                                     info!("Client {} authenticated", data.client_id);
+
+                                    // Replay any messages buffered while this client was
+                                    // disconnected (pending-delivery buffer, U3). Sent directly
+                                    // onto this connection's tx so they reach the client without
+                                    // going through the broadcast fan-out.
+                                    let replay_wm = Arc::clone(&ws_manager);
+                                    let replay_tx = tx.clone();
+                                    let replay_cid = data.client_id.clone();
+                                    tokio::spawn(async move {
+                                        for msg in replay_wm
+                                            .broker
+                                            .pending_delivery
+                                            .drain_for_client(&replay_cid)
+                                        {
+                                            if replay_tx
+                                                .send(WsMessage::Message {
+                                                    data: Box::new(msg),
+                                                })
+                                                .await
+                                                .is_err()
+                                            {
+                                                debug!(
+                                                    "Client {} gone during pending replay",
+                                                    replay_cid
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    });
                                 } else {
                                     let _ = tx
                                         .send(WsMessage::AuthResult {

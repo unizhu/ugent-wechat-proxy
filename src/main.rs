@@ -27,6 +27,7 @@ mod config;
 mod crypto;
 mod media_cache;
 mod outbound;
+mod pending_delivery;
 mod storage;
 mod types;
 mod webhook;

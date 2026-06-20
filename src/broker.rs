@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::ProxyConfig;
+use crate::pending_delivery::PendingDeliveryQueue;
 use crate::types::{
     Channel, MediaContent, OutboundArtifact, ProxyMessage, WechatMessage, WecomMessage,
 };
@@ -57,6 +58,10 @@ pub struct MessageBroker {
     wecom_api: Option<Arc<WecomApiClient>>,
     /// KF (Customer Service) API client for sync_msg (uses KF secret, not corp secret)
     pub kf_api: Option<Arc<WecomApiClient>>,
+
+    /// Pending-delivery buffer: holds messages that arrived while no client was
+    /// connected, replayed to the reconnecting client by `ws_manager`.
+    pub pending_delivery: PendingDeliveryQueue,
 }
 
 impl MessageBroker {
@@ -109,6 +114,7 @@ impl MessageBroker {
             wechat_api,
             wecom_api,
             kf_api,
+            pending_delivery: PendingDeliveryQueue::new(),
         }
     }
 
@@ -173,7 +179,19 @@ impl MessageBroker {
         message: WecomMessage,
         raw_xml: String,
     ) -> Result<String> {
-        let client_id = self.get_target_client_for_channel(Channel::Wecom)?;
+        let client_id = match self.get_target_client_for_channel(Channel::Wecom) {
+            Ok(id) => id,
+            Err(_) => {
+                // No WeCom client connected (worker stranded / disconnected). Buffer for
+                // replay on reconnect instead of losing the message: the dedup cache
+                // already committed this msgid and WeCom's sync cursor advanced, so
+                // buffering is the only recovery path (plan 2026-06-20-001 U3).
+                let buffered = ProxyMessage::wecom_inbound("wecom", message.clone(), raw_xml);
+                self.pending_delivery.enqueue("wecom", buffered);
+                info!("No WeCom client connected; buffered message for replay on reconnect");
+                return Ok("buffered".to_string());
+            }
+        };
         let proxy_msg = ProxyMessage::wecom_inbound(&client_id, message.clone(), raw_xml);
 
         let (tx, rx) = oneshot::channel();
@@ -211,9 +229,13 @@ impl MessageBroker {
         );
 
         if let Err(e) = self.message_tx.send(proxy_msg.clone()) {
-            warn!("Failed to broadcast message to WebSocket clients: {}", e);
+            warn!(
+                "Failed to broadcast WeCom message {}; buffering for replay on reconnect: {}",
+                proxy_msg.id, e
+            );
             self.pending.remove(&proxy_msg.id);
-            return Err(anyhow!("No connected WebSocket clients"));
+            self.pending_delivery.enqueue("wecom", proxy_msg);
+            return Ok("buffered".to_string());
         }
 
         let timeout_duration = Duration::from_secs(self.config.message_timeout_secs);
@@ -250,7 +272,16 @@ impl MessageBroker {
         raw_xml: String,
         media_content: MediaContent,
     ) -> Result<String> {
-        let client_id = self.get_target_client_for_channel(Channel::Wecom)?;
+        let client_id = match self.get_target_client_for_channel(Channel::Wecom) {
+            Ok(id) => id,
+            Err(_) => {
+                let mut buffered = ProxyMessage::wecom_inbound("wecom", message.clone(), raw_xml);
+                buffered.media_content = Some(media_content);
+                self.pending_delivery.enqueue("wecom", buffered);
+                info!("No WeCom client connected; buffered media message for replay on reconnect");
+                return Ok("buffered".to_string());
+            }
+        };
         let mut proxy_msg = ProxyMessage::wecom_inbound(&client_id, message.clone(), raw_xml);
 
         // Set media_content on the message
@@ -287,11 +318,12 @@ impl MessageBroker {
 
         if let Err(e) = self.message_tx.send(proxy_msg.clone()) {
             warn!(
-                "Failed to broadcast media message to WebSocket clients: {}",
-                e
+                "Failed to broadcast WeCom media message {}; buffering for replay on reconnect: {}",
+                proxy_msg.id, e
             );
             self.pending.remove(&proxy_msg.id);
-            return Err(anyhow!("No connected WebSocket clients"));
+            self.pending_delivery.enqueue("wecom", proxy_msg);
+            return Ok("buffered".to_string());
         }
 
         // For media messages, return immediately (response will be sent via API)

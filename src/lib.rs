@@ -47,6 +47,7 @@ pub mod config;
 pub mod crypto;
 pub mod media_cache;
 pub mod outbound;
+pub mod pending_delivery;
 pub mod storage;
 pub mod types;
 pub mod webhook;
