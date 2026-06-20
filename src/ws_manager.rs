@@ -13,6 +13,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -114,8 +115,33 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
         }
     });
 
-    // Receive messages from client
-    while let Some(msg) = ws_rx.next().await {
+    // Receive messages from client, with an idle watchdog: a client that sends
+    // nothing for `client_idle_timeout_secs` is evicted so its slot frees up and
+    // the broker stops treating a dead connection as an available client. The
+    // timeout restarts on every received frame (including the app-level pings a
+    // healthy worker sends each ping interval), so live clients are never dropped.
+    let idle_timeout = Duration::from_secs(ws_manager.broker.config.client_idle_timeout_secs);
+
+    loop {
+        let msg = match tokio::time::timeout(idle_timeout, ws_rx.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break, // stream ended
+            Err(_) => {
+                match &client_id {
+                    Some(cid) => info!(
+                        "Client {} idle for {}s with no frames, evicting",
+                        cid,
+                        idle_timeout.as_secs()
+                    ),
+                    None => info!(
+                        "Unauthenticated connection idle for {}s, closing",
+                        idle_timeout.as_secs()
+                    ),
+                }
+                break;
+            }
+        };
+
         match msg {
             Ok(Message::Text(text)) => {
                 match serde_json::from_str::<WsMessage>(&text) {

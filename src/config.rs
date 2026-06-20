@@ -89,6 +89,13 @@ pub struct ProxyConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections_per_client: usize,
 
+    /// Idle timeout (seconds): an authenticated client that sends no frames for
+    /// this long is evicted, freeing its slot and keeping the client registry
+    /// accurate. Must be larger than a client's ping interval so healthy clients
+    /// are never wrongly dropped.
+    #[serde(default = "default_client_idle_timeout")]
+    pub client_idle_timeout_secs: u64,
+
     /// Enable debug mode (log raw messages)
     #[serde(default)]
     pub debug_mode: bool,
@@ -146,6 +153,10 @@ fn default_message_timeout() -> u64 {
 
 fn default_max_connections() -> usize {
     10
+}
+
+fn default_client_idle_timeout() -> u64 {
+    120
 }
 
 fn default_rate_limit() -> u32 {
@@ -216,6 +227,10 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
+            client_idle_timeout_secs: std::env::var("CLIENT_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(default_client_idle_timeout),
             debug_mode: std::env::var("DEBUG_MODE").is_ok(),
             rate_limit: std::env::var("RATE_LIMIT")
                 .ok()
