@@ -331,6 +331,37 @@ impl MessageBroker {
         Ok("success".to_string())
     }
 
+    /// Re-deliver a buffered message through the normal forward path so the reply
+    /// machinery (pending-response map + KF/Application reply) is wired up. Called
+    /// by `ws_manager` when a client reconnects and drains the pending-delivery
+    /// buffer. Re-delivery is idempotent at the UGENT worker layer via bridge
+    /// dedupe, so a message the worker already partially handled is a no-op there.
+    pub async fn replay_buffered(&self, msg: ProxyMessage) {
+        if msg.channel != Channel::Wecom {
+            debug!("Replay skipped for non-WeCom buffered message {}", msg.id);
+            return;
+        }
+        let Some(wecom) = msg.wecom_message else {
+            warn!(
+                "Replay skipped: buffered WeCom message {} has no payload",
+                msg.id
+            );
+            return;
+        };
+        let raw_xml = msg.raw_xml.unwrap_or_default();
+        info!("Replaying buffered WeCom message {}", msg.id);
+        match msg.media_content {
+            Some(media) => {
+                let _ = self
+                    .forward_wecom_media_message(wecom, raw_xml, media)
+                    .await;
+            }
+            None => {
+                let _ = self.forward_wecom_message(wecom, raw_xml).await;
+            }
+        }
+    }
+
     /// Handle response from UGENT client (routes to correct channel)
     pub async fn handle_response(
         &self,

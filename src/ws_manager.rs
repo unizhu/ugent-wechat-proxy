@@ -198,11 +198,11 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                                     info!("Client {} authenticated", data.client_id);
 
                                     // Replay any messages buffered while this client was
-                                    // disconnected (pending-delivery buffer, U3). Sent directly
-                                    // onto this connection's tx so they reach the client without
-                                    // going through the broadcast fan-out.
+                                    // disconnected (pending-delivery buffer, U3). Re-deliver each
+                                    // through the normal forward path so the reply machinery
+                                    // (pending-response map + KF reply) is wired up — a direct
+                                    // tx send would bypass handle_response and drop the reply.
                                     let replay_wm = Arc::clone(&ws_manager);
-                                    let replay_tx = tx.clone();
                                     let replay_cid = data.client_id.clone();
                                     tokio::spawn(async move {
                                         for msg in replay_wm
@@ -210,19 +210,7 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                                             .pending_delivery
                                             .drain_for_client(&replay_cid)
                                         {
-                                            if replay_tx
-                                                .send(WsMessage::Message {
-                                                    data: Box::new(msg),
-                                                })
-                                                .await
-                                                .is_err()
-                                            {
-                                                debug!(
-                                                    "Client {} gone during pending replay",
-                                                    replay_cid
-                                                );
-                                                break;
-                                            }
+                                            replay_wm.broker.replay_buffered(msg).await;
                                         }
                                     });
                                 } else {

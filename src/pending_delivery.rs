@@ -101,14 +101,6 @@ impl PendingDeliveryQueue {
         }
     }
 
-    /// Number of buffered messages for a channel (observability / tests).
-    pub fn len_for(&self, channel_tag: &str) -> usize {
-        self.queues
-            .get(channel_tag)
-            .map(|q| q.lock().map(|g| g.len()).unwrap_or(0))
-            .unwrap_or(0)
-    }
-
     /// Map a client id to its channel tag, matching ws_manager's detection.
     fn channel_tag_for_client(client_id: &str) -> Option<&'static str> {
         let cid = client_id.to_lowercase();
@@ -158,18 +150,15 @@ mod tests {
     #[test]
     fn enqueue_then_drain_preserves_order() {
         let q = PendingDeliveryQueue::new();
-        assert_eq!(q.len_for("wecom"), 0);
         q.enqueue("wecom", sample_msg("a"));
         q.enqueue("wecom", sample_msg("b"));
         q.enqueue("wecom", sample_msg("c"));
-        assert_eq!(q.len_for("wecom"), 3);
 
         let drained = q.drain("wecom");
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].client_id, "a");
         assert_eq!(drained[2].client_id, "c");
         // drain empties the slot
-        assert_eq!(q.len_for("wecom"), 0);
         assert!(q.drain("wecom").is_empty());
     }
 
@@ -185,8 +174,8 @@ mod tests {
         q.enqueue("wecom", sample_msg("a"));
         q.enqueue("wecom", sample_msg("b"));
         q.enqueue("wecom", sample_msg("c")); // overflows, drops "a"
-        assert_eq!(q.len_for("wecom"), 2);
         let drained = q.drain("wecom");
+        assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].client_id, "b");
         assert_eq!(drained[1].client_id, "c");
     }
@@ -209,8 +198,8 @@ mod tests {
         let q = PendingDeliveryQueue::new();
         q.enqueue("wecom", sample_msg("z"));
         assert!(q.drain_for_client("some-other-client").is_empty());
-        // buffer is untouched
-        assert_eq!(q.len_for("wecom"), 1);
+        // buffer is untouched — the real wecom client still drains it
+        assert_eq!(q.drain_for_client("ugent-wecom").len(), 1);
     }
 
     #[test]
