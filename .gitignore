@@ -21,3 +21,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Cross-build output (docker buildx --output type=local,dest=dist)
+/dist/
