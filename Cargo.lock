@@ -2327,6 +2327,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha1",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",

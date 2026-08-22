@@ -7,6 +7,39 @@ use aes::cipher::{BlockDecryptMut, KeyIvInit};
 use anyhow::{Context, Result, anyhow};
 use base64::engine::general_purpose;
 use sha1::{Digest, Sha1};
+use subtle::ConstantTimeEq;
+
+/// How far a callback's `timestamp` may be from our clock, in seconds.
+///
+/// Neither WeChat nor WeCom binds a nonce to a message, so a captured
+/// `(timestamp, nonce, signature, body)` tuple is replayable forever unless the
+/// timestamp is bounded. Five minutes each way absorbs ordinary clock skew
+/// while keeping the replay window short.
+pub const TIMESTAMP_TOLERANCE_SECS: i64 = 300;
+
+/// Compare two ASCII digests without leaking their contents through timing.
+///
+/// The length is not secret — these are always SHA1 hex — so an early return on
+/// a length mismatch is fine.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
+/// Whether a callback timestamp is close enough to now to be accepted.
+///
+/// An unparseable timestamp is rejected: it cannot have been produced by the
+/// platform, and treating it as fresh would reopen the replay window.
+pub fn is_timestamp_fresh(timestamp: &str, tolerance_secs: i64) -> bool {
+    let Ok(sent) = timestamp.trim().parse::<i64>() else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    (now - sent).abs() <= tolerance_secs
+}
 
 /// WeChat cryptographic handler
 #[derive(Clone)]
@@ -21,26 +54,17 @@ impl WechatCrypto {
         // Trim whitespace and invisible characters
         let encoding_aes_key = encoding_aes_key.trim();
 
-        eprintln!("[DEBUG] EncodingAESKey length: {}", encoding_aes_key.len());
-        eprintln!(
-            "[DEBUG] EncodingAESKey first 10 chars: {}",
-            &encoding_aes_key[..encoding_aes_key.len().min(10)]
-        );
-
         if encoding_aes_key.len() != 43 {
+            // Never echo the key itself: this error is logged by both callers.
             return Err(anyhow!(
-                "EncodingAESKey must be 43 characters, got {} (value: '{}')",
-                encoding_aes_key.len(),
-                encoding_aes_key
+                "EncodingAESKey must be 43 characters, got {}",
+                encoding_aes_key.len()
             ));
         }
 
         // WeChat/WeCom official docs: AESKey = Base64_Decode(EncodingAESKey + "=")
         // https://developer.work.weixin.qq.com/document/path/90968
         let decoded = Self::decode_wecom_key(encoding_aes_key)?;
-
-        eprintln!("[DEBUG] Decoded key length: {}", decoded.len());
-        eprintln!("[DEBUG] Decoded key (hex): {:02x?}", decoded);
 
         if decoded.len() != 32 {
             return Err(anyhow!(
@@ -144,19 +168,19 @@ impl WechatCrypto {
             return Err(anyhow!("Decoded to {} bytes, expected 32", result.len()));
         }
 
-        eprintln!(
-            "[DEBUG] Manual decode succeeded, key hex: {:02x?}",
-            &result[..8]
-        );
         Ok(result)
     }
 
     /// Verify WeChat signature
     ///
     /// WeChat sends: signature = SHA1(sort(token, timestamp, nonce))
+    ///
+    /// Note this digest does **not** cover the request body, so on its own it
+    /// authenticates nothing about the message. Callers handling a POST must
+    /// also verify `msg_signature`, which does.
     pub fn verify(token: &str, timestamp: &str, nonce: &str, signature: &str) -> bool {
         let computed = Self::sign(token, timestamp, nonce);
-        computed == signature
+        constant_time_eq(&computed, signature)
     }
 
     /// Generate signature
@@ -182,7 +206,7 @@ impl WechatCrypto {
 
         let combined = parts.join("");
         let hash = Sha1::digest(combined.as_bytes());
-        hex::encode(hash) == msg_signature
+        constant_time_eq(&hex::encode(hash), msg_signature)
     }
 
     /// Decrypt WeChat message
@@ -192,16 +216,6 @@ impl WechatCrypto {
         // Base64 decode
         let encrypted_bytes = base64::Engine::decode(&general_purpose::STANDARD, encrypted)
             .context("Failed to base64 decode encrypted message")?;
-
-        eprintln!("[DEBUG] Encrypted bytes length: {}", encrypted_bytes.len());
-        eprintln!(
-            "[DEBUG] Key (first 8 bytes): {:02x?}",
-            &self.encoding_aes_key[..8]
-        );
-        eprintln!(
-            "[DEBUG] IV (first 8 bytes): {:02x?}",
-            &self.encoding_aes_key[..8]
-        );
 
         if encrypted_bytes.len() < 32 {
             return Err(anyhow!(
@@ -274,9 +288,6 @@ impl WechatCrypto {
             msg_len_bytes[3],
         ]) as usize;
 
-        eprintln!("[DEBUG] Decrypted msg_len: {}", msg_len);
-        eprintln!("[DEBUG] Decrypted total len: {}", decrypted.len());
-
         if decrypted.len() < 20 + msg_len {
             return Err(anyhow!(
                 "Invalid message length: declared {} bytes but only have {} bytes",
@@ -331,9 +342,7 @@ impl WechatCrypto {
         buf[20 + msg_bytes.len()..total_len].copy_from_slice(app_id_bytes);
 
         // Manual PKCS7 padding
-        for i in total_len..final_len {
-            buf[i] = pad_len as u8;
-        }
+        buf[total_len..final_len].fill(pad_len as u8);
 
         // AES encrypt without standard padding
         type Aes256CbcEncNoPadding = cbc::Encryptor<aes::Aes256>;
@@ -355,6 +364,36 @@ impl WechatCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        // Differing lengths must not panic on the ct_eq slice compare.
+        assert!(!constant_time_eq("abc", "abcdef"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn timestamp_freshness_bounds_the_replay_window() {
+        let now = chrono::Utc::now().timestamp();
+        assert!(is_timestamp_fresh(&now.to_string(), 300));
+        // Clock skew in both directions is tolerated inside the window.
+        assert!(is_timestamp_fresh(&(now - 299).to_string(), 300));
+        assert!(is_timestamp_fresh(&(now + 299).to_string(), 300));
+        assert!(!is_timestamp_fresh(&(now - 301).to_string(), 300));
+        assert!(!is_timestamp_fresh(&(now + 301).to_string(), 300));
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_is_not_fresh() {
+        // Treating a garbage timestamp as fresh would reopen the replay window
+        // to anyone who simply omits or mangles the value.
+        assert!(!is_timestamp_fresh("", 300));
+        assert!(!is_timestamp_fresh("not-a-number", 300));
+        assert!(!is_timestamp_fresh("99999999999999999999", 300));
+    }
 
     #[test]
     fn test_sign_and_verify() {
@@ -395,18 +434,5 @@ mod tests {
         let decoded = WechatCrypto::decode_wecom_key(&key_43);
         assert!(decoded.is_ok());
         assert_eq!(decoded.unwrap().len(), 32);
-    }
-}
-
-#[cfg(test)]
-mod test_real_key {
-    use super::*;
-
-    #[test]
-    fn test_real_wecom_key() {
-        let key = "REDACTED_ROTATED_WECOM_AES_KEY";
-        let decoded = WechatCrypto::decode_wecom_key(key).expect("Failed to decode");
-        eprintln!("[TEST] Real key decoded: {:02x?}", decoded);
-        assert_eq!(decoded.len(), 32);
     }
 }

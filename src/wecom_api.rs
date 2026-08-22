@@ -286,9 +286,12 @@ impl WecomApiClient {
             limit: Some(100),
         };
 
+        // The token is short-lived but still grants sync_msg over the whole
+        // conversation, so log only its length. The old `&token[..20]` slice
+        // also panicked when byte 20 fell mid-UTF-8-sequence.
         debug!(
-            "Syncing KF messages with token: {}..., open_kfid: {}",
-            &token[..20.min(token.len())],
+            "Syncing KF messages: token_len={}, open_kfid: {}",
+            token.len(),
             open_kfid
         );
 

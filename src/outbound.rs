@@ -131,46 +131,38 @@ impl OutboundMediaHandler {
                 .context("Failed to decode base64 artifact data");
         }
 
-        // Priority 2: Local file path
+        // Priority 2: Local file path.
+        //
+        // The worker is a separate process, usually on a separate host, so this
+        // path is attacker-controlled input. Every path — relative included —
+        // is canonicalized and then required to sit inside the temp directory.
+        //
+        // Canonicalizing first is what makes the check sound: it resolves `..`
+        // and follows symlinks, so containment is decided on the real target
+        // rather than on the spelling. The previous version only checked
+        // absolute paths, which left a relative `.env` resolving against the
+        // process CWD — the same directory the systemd unit keeps its
+        // EnvironmentFile in.
         if let Some(ref path_str) = artifact.local_path {
             let path = Path::new(path_str);
 
-            // Validate path security:
-            // 1. No directory traversal (..)
-            // 2. For absolute paths, only allow safe directories (OS temp)
-            // 3. No prefix components (Windows drive letters)
-            if path.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                )
-            }) {
-                return Err(anyhow!("Invalid path: directory traversal not allowed"));
+            let canonical_path = path
+                .canonicalize()
+                .map_err(|e| anyhow!("Failed to resolve artifact path {:?}: {}", path, e))?;
+
+            let temp_dir = std::env::temp_dir();
+            let canonical_temp = temp_dir.canonicalize().unwrap_or(temp_dir);
+
+            if !canonical_path.starts_with(&canonical_temp) {
+                return Err(anyhow!(
+                    "Refusing to read artifact outside the temp directory: {:?}",
+                    path
+                ));
             }
 
-            // For absolute paths, validate they are in safe directories
-            if path.is_absolute() {
-                let temp_dir = std::env::temp_dir();
-                let canonical_path = path
-                    .canonicalize()
-                    .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
-                let canonical_temp = temp_dir.canonicalize().unwrap_or(temp_dir);
-
-                // Only allow files in OS temp directory for absolute paths
-                if !canonical_path.starts_with(&canonical_temp) {
-                    return Err(anyhow!(
-                        "Invalid path: absolute paths only allowed in temp directory"
-                    ));
-                }
-            }
-
-            // Use async file existence check (non-blocking)
-            if tokio::fs::metadata(path).await.is_ok() {
-                return fs::read(path)
-                    .await
-                    .with_context(|| format!("Failed to read artifact file: {:?}", path));
-            }
-            return Err(anyhow!("Artifact file does not exist: {:?}", path));
+            return fs::read(&canonical_path)
+                .await
+                .with_context(|| format!("Failed to read artifact file: {:?}", canonical_path));
         }
 
         // Priority 3: URL (not implemented in Phase 1)
@@ -239,6 +231,79 @@ impl OutboundMediaHandler {
 mod tests {
     use super::*;
 
+    fn handler() -> OutboundMediaHandler {
+        OutboundMediaHandler::new(
+            Arc::new(WecomApiClient::new(
+                "ww123456".to_string(),
+                "secret".to_string(),
+                1,
+            )),
+            None,
+        )
+    }
+
+    fn artifact_at(local_path: &str) -> OutboundArtifact {
+        OutboundArtifact {
+            kind: OutboundArtifactKind::Document,
+            name: "x".to_string(),
+            data: None,
+            local_path: Some(local_path.to_string()),
+            url: None,
+            content_type: None,
+            caption: None,
+            size_bytes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relative_path_cannot_escape_the_temp_directory() {
+        // Regression: relative paths used to skip containment entirely and were
+        // read from the process CWD — which the deployed systemd unit sets to
+        // the directory holding the EnvironmentFile, so `.env` was readable by
+        // any worker that could reach the WebSocket port.
+        let err = handler()
+            .get_artifact_data(&artifact_at(".env"))
+            .await
+            .expect_err("a relative path must not be read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Refusing to read artifact outside the temp directory")
+                || msg.contains("Failed to resolve artifact path"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_path_outside_temp_is_refused() {
+        // /etc/hosts is real and readable, so passing this proves the
+        // containment check ran rather than the open merely failing.
+        let err = handler()
+            .get_artifact_data(&artifact_at("/etc/hosts"))
+            .await
+            .expect_err("/etc/hosts must not be readable as an artifact");
+        assert!(
+            err.to_string()
+                .contains("Refusing to read artifact outside the temp directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_inside_temp_is_still_readable() {
+        let dir = std::env::temp_dir().join("ugent-outbound-containment-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("ok.txt");
+        tokio::fs::write(&path, b"payload").await.unwrap();
+
+        let bytes = handler()
+            .get_artifact_data(&artifact_at(path.to_str().unwrap()))
+            .await
+            .expect("a file inside the temp directory should still be sendable");
+        assert_eq!(bytes, b"payload");
+
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
     #[test]
     fn test_kind_to_media_type() {
         assert_eq!(
@@ -276,27 +341,47 @@ mod tests {
         assert_eq!(MAX_FILE_SIZE, 20 * 1024 * 1024);
     }
 
+    // The three tests below previously compared constants to literals, which is
+    // always true and exercised none of the code. They now call validate_size.
+
     #[test]
     fn test_validate_size_ok() {
-        // Test the validation logic directly without creating a full handler
-        // Valid sizes should be >= MIN_FILE_SIZE (5) and <= max
-        assert!((1000usize) >= MIN_FILE_SIZE && 1000 <= MAX_IMAGE_SIZE);
-        assert!((1000usize) >= MIN_FILE_SIZE && 1000 <= MAX_VOICE_SIZE);
-        assert!((1000usize) >= MIN_FILE_SIZE && 1000 <= MAX_FILE_SIZE);
+        let h = handler();
+        for kind in [
+            OutboundArtifactKind::Image,
+            OutboundArtifactKind::Audio,
+            OutboundArtifactKind::Video,
+            OutboundArtifactKind::Document,
+        ] {
+            assert!(h.validate_size(&kind, 1000).is_ok(), "{kind:?}");
+        }
     }
 
     #[test]
     fn test_validate_size_too_small() {
-        // Too small (< 5 bytes)
-        assert!((4usize) < MIN_FILE_SIZE);
+        assert!(
+            handler()
+                .validate_size(&OutboundArtifactKind::Image, MIN_FILE_SIZE - 1)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_validate_size_exceeded() {
-        // Exceeds limit
-        assert!((MAX_IMAGE_SIZE + 1) > MAX_IMAGE_SIZE);
-        assert!((MAX_VOICE_SIZE + 1) > MAX_VOICE_SIZE);
-        assert!((MAX_VIDEO_SIZE + 1) > MAX_VIDEO_SIZE);
-        assert!((MAX_FILE_SIZE + 1) > MAX_FILE_SIZE);
+        let h = handler();
+        // WeCom enforces a different ceiling per type, so each is checked
+        // against its own limit rather than a shared one.
+        for (kind, max) in [
+            (OutboundArtifactKind::Image, MAX_IMAGE_SIZE),
+            (OutboundArtifactKind::Audio, MAX_VOICE_SIZE),
+            (OutboundArtifactKind::Video, MAX_VIDEO_SIZE),
+            (OutboundArtifactKind::Document, MAX_FILE_SIZE),
+        ] {
+            assert!(h.validate_size(&kind, max).is_ok(), "{kind:?} at limit");
+            assert!(
+                h.validate_size(&kind, max + 1).is_err(),
+                "{kind:?} one byte over the limit must be refused"
+            );
+        }
     }
 }

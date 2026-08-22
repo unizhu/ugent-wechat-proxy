@@ -27,9 +27,10 @@ RUN touch src/main.rs && cargo build --release
 # =============================================================================
 FROM debian:bookworm-slim
 
-# Install ca-certificates for HTTPS
+# ca-certificates for HTTPS; curl is what HEALTHCHECK below shells out to.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -46,8 +47,8 @@ RUN chown -R ugent:ugent /app
 # Switch to non-root user
 USER ugent
 
-# Expose ports
-EXPOSE 8080 8081
+# OA webhook, worker WebSocket, WeCom callback.
+EXPOSE 8080 8081 8082
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
