@@ -88,10 +88,7 @@ async fn verify(
     State(state): State<WebhookState>,
     Query(params): Query<VerifyParams>,
 ) -> Result<String, StatusCode> {
-    info!(
-        "📥 Received verification request from WeChat: timestamp={}, nonce={}, signature={}",
-        params.timestamp, params.nonce, params.signature
-    );
+    info!("📥 Received verification request from WeChat");
 
     if !WechatCrypto::verify(
         &state.config.wechat_token,
@@ -118,9 +115,10 @@ async fn handle_message(
     Query(params): Query<EncryptedParams>,
     body: Bytes,
 ) -> Result<String, StatusCode> {
+    // Deliberately without the signature triple; see log_request.
     info!(
-        "📥 Received message from WeChat: timestamp={}, nonce={}, signature={}, encrypt_type={:?}",
-        params.timestamp, params.nonce, params.signature, params.encrypt_type
+        "📥 Received message from WeChat: encrypt_type={:?}",
+        params.encrypt_type
     );
     debug!("Request body length: {} bytes", body.len());
 
