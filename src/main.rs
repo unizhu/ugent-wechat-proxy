@@ -99,17 +99,11 @@ async fn main() -> Result<()> {
     let ws_addr: SocketAddr = config.websocket_addr.parse()?;
     let ws_server = spawn_websocket_server(ws_addr, ws_manager.clone());
 
-    info!(
-        "🌐 WeChat webhook server listening on {}",
-        config.webhook_addr
-    );
-    if config.wecom_enabled {
-        info!(
-            "🏢 WeCom webhook server listening on {}",
-            config.wecom_webhook_addr
-        );
-    }
-    info!("🔌 WebSocket server listening on {}", config.websocket_addr);
+    // Each server logs its own address once it has actually bound. Announcing
+    // here would print "listening" for a server that then fails to bind, which
+    // is how an address conflict on one listener ends up looking like a fault
+    // in another.
+    info!("⏳ Servers starting…");
 
     // Wait for shutdown signal
     match signal::ctrl_c().await {
@@ -136,7 +130,7 @@ fn spawn_webhook_server(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = webhook::run_server(addr, broker).await {
-            tracing::error!("Webhook server error: {}", e);
+            tracing::error!("WeChat OA webhook server error: {}", e);
         }
     })
 }

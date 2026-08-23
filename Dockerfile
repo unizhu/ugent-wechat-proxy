@@ -2,8 +2,20 @@
 # UGENT WeChat Proxy - Dockerfile
 # =============================================================================
 
+# On an Apple Silicon host, produce a linux/amd64 binary with:
+#
+#   docker buildx build --platform linux/amd64 \
+#     --target export --output type=local,dest=dist .
+#
+# OrbStack runs the amd64 build under Rosetta. For a runnable image instead of
+# a bare binary, drop --target/--output and use --load.
+
+# Must be >= the crate's rust-version (Cargo.toml). This was pinned at 1.83,
+# which cannot build an edition-2024 crate.
+ARG RUST_VERSION=1.96
+
 # Build stage
-FROM rust:1.83-bookworm AS builder
+FROM rust:${RUST_VERSION}-bookworm AS builder
 
 WORKDIR /app
 
@@ -23,13 +35,20 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
 # =============================================================================
+# Export stage: bare binary, for --output type=local
+# =============================================================================
+FROM scratch AS export
+COPY --from=builder /app/target/release/ugent-wechat-proxy /
+
+# =============================================================================
 # Runtime stage
 # =============================================================================
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 
-# Install ca-certificates for HTTPS
+# ca-certificates for HTTPS; curl is what HEALTHCHECK below shells out to.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -46,8 +65,8 @@ RUN chown -R ugent:ugent /app
 # Switch to non-root user
 USER ugent
 
-# Expose ports
-EXPOSE 8080 8081
+# OA webhook, worker WebSocket, WeCom callback.
+EXPOSE 8080 8081 8082
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

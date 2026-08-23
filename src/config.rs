@@ -33,6 +33,15 @@ pub struct ProxyConfig {
     #[serde(default = "default_wechat_webhook_path")]
     pub wechat_webhook_path: String,
 
+    /// Accept unencrypted (明文模式) callback POSTs.
+    ///
+    /// Off by default. In plaintext mode WeChat signs only
+    /// (token, timestamp, nonce), never the body, so a single replayed
+    /// signature triple carries an attacker-chosen message. Safe mode
+    /// (安全模式) adds `msg_signature` over the ciphertext, which does bind it.
+    #[serde(default)]
+    pub allow_plaintext_webhook: bool,
+
     // =========================================================================
     // WeCom (企业微信) Configuration
     // =========================================================================
@@ -177,6 +186,22 @@ fn default_media_cache_dir() -> String {
 }
 
 impl ProxyConfig {
+    /// Read a boolean env var, treating only affirmative values as true.
+    ///
+    /// The older `std::env::var(..).is_ok()` idiom used elsewhere in this file
+    /// treats `FOO=false` as true, which is the opposite of what an operator
+    /// writing that would expect.
+    fn env_bool(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok(); // Load .env file if present
@@ -184,6 +209,16 @@ impl ProxyConfig {
         let wechat_token = std::env::var("WECHAT_TOKEN").context("WECHAT_TOKEN is required")?;
 
         let api_key = std::env::var("PROXY_API_KEY").context("PROXY_API_KEY is required")?;
+        // `PROXY_API_KEY=` satisfies `var()` but then matches any client that
+        // sends an empty key, which is worse than being unset.
+        if api_key.trim().is_empty() {
+            anyhow::bail!(
+                "PROXY_API_KEY is empty — any client that can reach the WebSocket port \
+                 would be able to authenticate and both read inbound messages and send \
+                 replies as this account"
+            );
+        }
+        let api_key = api_key.trim().to_string();
 
         Ok(Self {
             // WeChat OA config
@@ -195,6 +230,7 @@ impl ProxyConfig {
             webhook_addr: std::env::var("WEBHOOK_ADDR").unwrap_or_else(|_| default_webhook_addr()),
             wechat_webhook_path: std::env::var("WECHAT_WEBHOOK_PATH")
                 .unwrap_or_else(|_| default_wechat_webhook_path()),
+            allow_plaintext_webhook: Self::env_bool("WECHAT_ALLOW_PLAINTEXT_WEBHOOK"),
 
             // WeCom config
             wecom_enabled: std::env::var("WECOM_ENABLED").is_ok(),

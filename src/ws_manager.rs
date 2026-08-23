@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::broker::MessageBroker;
+use crate::crypto::constant_time_eq;
 use crate::types::{ProxyMessage, WsMessage};
 
 /// WebSocket manager state
@@ -148,8 +149,12 @@ async fn handle_socket(socket: WebSocket, ws_manager: Arc<WebSocketManager>, add
                     Ok(ws_msg) => {
                         match ws_msg {
                             WsMessage::Auth { data } => {
-                                // Validate API key
-                                if data.api_key == ws_manager.broker.config.api_key {
+                                // Compared in constant time so a wrong key
+                                // cannot be recovered byte by byte.
+                                if constant_time_eq(
+                                    &data.api_key,
+                                    &ws_manager.broker.config.api_key,
+                                ) {
                                     if !ws_manager.broker.config.is_client_allowed(&data.client_id)
                                     {
                                         let _ = tx

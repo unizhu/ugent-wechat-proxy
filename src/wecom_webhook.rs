@@ -77,8 +77,10 @@ pub async fn run_server(
         .route("/health", get(health_check))
         .with_state(state);
 
-    info!("🔌 WeCom webhook server starting on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("WeCom webhook could not bind {addr}: {e}"))?;
+    info!("🏢 WeCom webhook listening on {addr}");
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -122,10 +124,17 @@ async fn verify_url(
     );
 
     if !is_valid {
-        warn!(
-            "WeCom URL signature verification failed: expected_signature={}, token={}",
-            params.msg_signature, token
-        );
+        // Never log the token: it authenticates every callback, and this branch
+        // is reachable by anyone who can probe the endpoint.
+        warn!("WeCom URL signature verification failed");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    if !crate::crypto::is_timestamp_fresh(
+        &params.timestamp,
+        crate::crypto::TIMESTAMP_TOLERANCE_SECS,
+    ) {
+        warn!("WeCom URL verification rejected: timestamp outside the accepted window");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -193,10 +202,17 @@ async fn handle_message(
     );
 
     if !is_valid {
-        warn!(
-            "WeCom message signature verification failed: msg_signature={}",
-            params.msg_signature
-        );
+        warn!("WeCom message signature verification failed");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // msg_signature binds the ciphertext, but nothing binds the request to a
+    // point in time — without this a captured callback replays indefinitely.
+    if !crate::crypto::is_timestamp_fresh(
+        &params.timestamp,
+        crate::crypto::TIMESTAMP_TOLERANCE_SECS,
+    ) {
+        warn!("WeCom message rejected: timestamp outside the accepted window");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -249,12 +265,7 @@ async fn handle_message(
             // Spawn background task to call sync_msg and process messages
             tokio::spawn(async move {
                 process_kf_sync_msg_background(
-                    &kf_client,
-                    &state,
-                    &message,
-                    &body,
-                    &token,
-                    &open_kfid,
+                    &kf_client, &state, &message, &body, &token, &open_kfid,
                 )
                 .await;
             });
@@ -349,10 +360,7 @@ async fn process_kf_sync_msg_background(
                 if let Some(kf_msg) = latest_msg {
                     info!(
                         "Processing LATEST KF message in background: msgid={}, msgtype={}, external_user={:?}, send_time={}",
-                        kf_msg.msgid,
-                        kf_msg.msgtype,
-                        kf_msg.external_userid,
-                        kf_msg.send_time
+                        kf_msg.msgid, kf_msg.msgtype, kf_msg.external_userid, kf_msg.send_time
                     );
 
                     let external_user = kf_msg
@@ -366,8 +374,15 @@ async fn process_kf_sync_msg_background(
 
                     // Process based on message type
                     match kf_msg.msgtype.as_str() {
+                        // Each arm below trusts that the payload matching
+                        // `msgtype` is present. It comes from a remote JSON
+                        // response, so a mismatch is a dropped message, not a
+                        // panic that aborts the whole sync task.
                         "text" => {
-                            let text = kf_msg.text.as_ref().unwrap();
+                            let Some(text) = kf_msg.text.as_ref() else {
+                                warn!("KF message declared msgtype=text but carried no text body");
+                                return;
+                            };
                             process_kf_text_message(
                                 state,
                                 original_message,
@@ -382,7 +397,12 @@ async fn process_kf_sync_msg_background(
                             .await;
                         }
                         "image" => {
-                            let image = kf_msg.image.as_ref().unwrap();
+                            let Some(image) = kf_msg.image.as_ref() else {
+                                warn!(
+                                    "KF message declared msgtype=image but carried no image body"
+                                );
+                                return;
+                            };
                             info!(
                                 "Processing image message: media_id={:?}, cos_url={:?}, file_size={:?}",
                                 image.media_id, image.cos_url, image.file_size
@@ -459,7 +479,12 @@ async fn process_kf_sync_msg_background(
                             );
                         }
                         "voice" => {
-                            let voice = kf_msg.voice.as_ref().unwrap();
+                            let Some(voice) = kf_msg.voice.as_ref() else {
+                                warn!(
+                                    "KF message declared msgtype=voice but carried no voice body"
+                                );
+                                return;
+                            };
                             process_kf_voice_message(
                                 state,
                                 original_message,
@@ -478,9 +503,7 @@ async fn process_kf_sync_msg_background(
                         }
                     }
                 } else {
-                    warn!(
-                        "No matching KF message found (origin=3 with text/image/voice content)"
-                    );
+                    warn!("No matching KF message found (origin=3 with text/image/voice content)");
                 }
             }
         }
